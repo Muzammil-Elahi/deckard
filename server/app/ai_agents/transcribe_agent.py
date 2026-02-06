@@ -5,7 +5,7 @@ from typing import Optional
 
 from openai import OpenAI
 
-from app.services.did_talks import _pcm16le_to_wav
+from app.services.audio_utils import pcm16le_to_wav
 
 
 class TranscribeTalkAgent:
@@ -20,7 +20,7 @@ class TranscribeTalkAgent:
         self.chat_model = chat_model
 
     def transcribe_pcm(self, pcm: bytes, sample_rate: int = 24_000) -> str:
-        wav_bytes = _pcm16le_to_wav(pcm, sample_rate=sample_rate)
+        wav_bytes = pcm16le_to_wav(pcm, sample_rate=sample_rate)
         f = io.BytesIO(wav_bytes)
         f.name = "audio.wav"  # openai python SDK reads name for mime
         resp = self.client.audio.transcriptions.create(model=self.transcription_model, file=f)

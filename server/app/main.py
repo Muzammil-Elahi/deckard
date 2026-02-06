@@ -69,11 +69,10 @@ except ImportError:
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-from app.services.did_talks import (
-    DIDTalksService,
+from app.services.lipsync import (
+    LipSyncService,
     resolve_persona_image,
 )
-from app.services.did_talks import resolve_persona_source_url  # unused in realtime-only flow
 
 
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
@@ -164,8 +163,7 @@ class RealtimeWebSocketManager:
         self.persona_videos: dict[str, str] = {}
         self._event_tasks: dict[str, asyncio.Task] = {}
         # Service instance (lazy)
-        self._did_service: DIDTalksService | None = None
-        self._default_webhook: Optional[str] = settings.did_webhook_url
+        self._lipsync_service: LipSyncService | None = None
 
         # New response buffering system
         self.response_buffers: dict[str, ResponseBuffer] = {}  # session_id -> current response buffer
@@ -177,16 +175,20 @@ class RealtimeWebSocketManager:
         self.active_response_ids: dict[str, str] = {}  # session_id -> current response_id
 
         # Configuration flags
-        self.enable_response_buffering: bool = False  # Feature flag for buffering responses (disabled while fixing)
+        self.enable_response_buffering: bool = False  # Disabled for MVP to prioritize low-latency audio path.
 
-    def _service(self) -> DIDTalksService:
-        if self._did_service is None:
+    def _service(self) -> LipSyncService:
+        if self._lipsync_service is None:
             try:
-                self._did_service = DIDTalksService(webhook=self._default_webhook)
+                self._lipsync_service = LipSyncService(
+                    poll_interval_seconds=settings.runpod_poll_interval_seconds,
+                    timeout_seconds=settings.runpod_job_timeout_seconds,
+                    model_name=settings.lipsync_model_name,
+                )
             except Exception as e:
-                logger.error("Failed to initialize D-ID service: %s", e)
+                logger.error("Failed to initialize lip-sync service: %s", e)
                 raise
-        return self._did_service
+        return self._lipsync_service
 
 
     async def connect(self, websocket: WebSocket, session_id: str):
@@ -267,18 +269,6 @@ class RealtimeWebSocketManager:
         if not session:
             return
         await session.interrupt()
-
-    def _has_text_generation_available(self, persona: str) -> bool:
-        """Check if text-based D-ID generation is available for this persona."""
-        try:
-            from app.services.did_talks import resolve_persona_source_url as _r
-        except Exception:
-            from services.did_talks import resolve_persona_source_url as _r
-        return bool(_r(persona))
-
-    def _should_use_audio_for_did(self, persona: str) -> bool:
-        """Check if we should use audio for D-ID generation (when no source URL is configured)."""
-        return not self._has_text_generation_available(persona)
 
     def _resolve_persona_video(self, persona: str, sentiment: str) -> str:
         persona_key = (persona or "joi").lower()
@@ -542,7 +532,11 @@ class RealtimeWebSocketManager:
         return " ".join(text_parts).strip()
 
     async def _handle_assistant_response_output(self, session_id: str, response: Any) -> None:
-        """Route assistant response text into the appropriate video generation path."""
+        """Use assistant text for sentiment/mood updates only.
+
+        In the RunPod lip-sync MVP, video generation is driven by assistant audio
+        frames (collected from realtime events) rather than text.
+        """
         assistant_text = self._extract_assistant_text_from_response(response)
         if not assistant_text:
             logger.info(f"[Session {session_id}] No assistant text found in response output")
@@ -559,39 +553,32 @@ class RealtimeWebSocketManager:
         )
         await self.send_persona_mood_update(session_id, sentiment=sentiment)
 
-        if self.enable_response_buffering:
-            persona = self.persona.get(session_id, "joi")
-            if self._has_text_generation_available(persona):
-                await self._handle_buffered_text(session_id, assistant_text)
-            else:
-                logger.info(
-                    f"[Session {session_id}] Persona {persona} lacks text generation support; skipping buffered video trigger"
-                )
-            return
-
-        await self._trigger_video_from_text(session_id, assistant_text)
+        return
 
     async def _generate_buffered_video(self, session_id: str, buffer: ResponseBuffer) -> None:
         """Generate video for buffered response and coordinate final playback."""
         try:
             persona = self.persona.get(session_id, "joi")
-            logger.info(f"[Session {session_id}] Starting buffered video generation for response {buffer.response_id}")
-
-            # Generate the video
-            src = resolve_persona_source_url(persona)
-            if not src:
-                logger.error(f"[Session {session_id}] No source URL for persona {persona}")
-                await self._send_buffered_response_error(session_id, "No source URL configured")
+            logger.info(
+                f"[Session {session_id}] Starting buffered lip-sync generation for response {buffer.response_id}"
+            )
+            pcm = buffer.get_full_audio()
+            if not pcm:
+                await self._send_buffered_response_error(
+                    session_id, "No assistant audio available for buffered video generation"
+                )
                 return
 
             service = self._service()
-            voice_id = self._get_persona_voice_id(persona)
+            image_path = resolve_persona_image(persona)
 
-            logger.info(f"[Session {session_id}] Calling D-ID API for buffered response")
-            result = await service.generate_talk_from_text(
-                source_url=src,
-                text=buffer.complete_text,
-                voice_id=voice_id
+            logger.info(f"[Session {session_id}] Calling RunPod lip-sync API for buffered response")
+            result = await service.generate_talk_from_pcm(
+                pcm_bytes=pcm,
+                sample_rate=24_000,
+                persona_image_path=image_path,
+                session_id=session_id,
+                persona=persona,
             )
 
             # Store video result in buffer
@@ -995,12 +982,14 @@ class RealtimeWebSocketManager:
             logger.exception(f"[Session {session_id}] Error extracting text from output item: {e}")
 
     async def _trigger_video_from_text(self, session_id: str, text: str) -> None:
-        """Trigger D-ID video generation from extracted text."""
+        """Text-triggered video generation is disabled in RunPod audio-first MVP."""
         if not text.strip():
             return
 
         persona = self.persona.get(session_id, "joi")
-        logger.info(f"[Session {session_id}] Triggering video generation for persona {persona}")
+        logger.info(
+            f"[Session {session_id}] Skipping text-triggered video generation for persona {persona}"
+        )
 
         # Also classify sentiment when triggering video to ensure mood is updated
         sentiment = await self._classify_sentiment(text)
@@ -1009,12 +998,6 @@ class RealtimeWebSocketManager:
         )
         await self.send_persona_mood_update(session_id, sentiment=sentiment)
 
-        if self._has_text_generation_available(persona):
-            logger.info(f"[Session {session_id}] Starting D-ID video generation with text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
-            asyncio.create_task(self._create_talk_from_text_and_notify(session_id, text))
-        else:
-            logger.info(f"[Session {session_id}] No text generation available for persona {persona} (no source URL configured)")
-
     async def _process_events(self, session_id: str):
         task = asyncio.current_task()
         try:
@@ -1022,28 +1005,21 @@ class RealtimeWebSocketManager:
             websocket = self.websockets[session_id]
 
             async for event in session:
-                # Intercept assistant audio stream and build a D-ID talk when the turn ends
+                # Intercept assistant audio stream and build a lip-sync video when the turn ends.
                 if event.type == "audio":
-                    persona = self.persona.get(session_id, "joi")
-
-                    # Check if we should use buffering for coordinated playback
-                    if self.enable_response_buffering and self._has_text_generation_available(persona):
-                        # Use new buffering system for coordinated audio/video
+                    # Check if we should use buffering for coordinated playback.
+                    if self.enable_response_buffering:
                         await self._handle_buffered_audio(session_id, event.audio.data)
                     else:
-                        # Legacy audio handling - immediate playback and optional D-ID from audio
-                        if self._should_use_audio_for_did(persona):
-                            self.response_audio_buffers.setdefault(session_id, bytearray()).extend(event.audio.data)
+                        # Immediate mode: always accumulate assistant audio for post-turn lip-sync.
+                        self.response_audio_buffers.setdefault(session_id, bytearray()).extend(event.audio.data)
                 elif event.type == "audio_end":
-                    # Generate audio-based D-ID talk if no text source URL is configured
-                    persona = self.persona.get(session_id, "joi")
-                    if self._should_use_audio_for_did(persona):
-                        pcm = bytes(self.response_audio_buffers.get(session_id, b""))
-                        self.response_audio_buffers[session_id] = bytearray()
-                        if pcm:
-                            asyncio.create_task(self._create_talk_and_notify(session_id, pcm))
+                    pcm = bytes(self.response_audio_buffers.get(session_id, b""))
+                    self.response_audio_buffers[session_id] = bytearray()
+                    if pcm:
+                        asyncio.create_task(self._create_talk_and_notify(session_id, pcm))
                 elif event.type == "history_added":
-                    # If the assistant produced text, kick off a D-ID talk from text
+                    # Use history events for sentiment/mood tracking only.
                     logger.info(f"[Session {session_id}] Processing history_added event")
                     try:
                         item = getattr(event, "item", None)
@@ -1089,21 +1065,6 @@ class RealtimeWebSocketManager:
                                     f"[Session {session_id}] Classified assistant message sentiment as '{sentiment}'"
                                 )
                                 await self.send_persona_mood_update(session_id, sentiment=sentiment)
-
-                                if self._has_text_generation_available(persona):
-                                    if self.enable_response_buffering:
-                                        # Use new buffering system for coordinated audio/video
-                                        await self._handle_buffered_text(
-                                            session_id,
-                                            full_text,
-                                            role=role,
-                                        )
-                                    else:
-                                        # Legacy immediate D-ID generation
-                                        logger.info(f"[Session {session_id}] Text generation available for persona {persona}, starting D-ID video generation")
-                                        asyncio.create_task(self._create_talk_from_text_and_notify(session_id, full_text))
-                                else:
-                                    logger.info(f"[Session {session_id}] No text generation available for persona {persona} (no source URL configured)")
                             else:
                                 logger.info(f"[Session {session_id}] No text extracted from assistant message")
                         elif item_type == "message" and role == "user":
@@ -1184,21 +1145,27 @@ class RealtimeWebSocketManager:
         try:
             service = self._service()
             image_path = resolve_persona_image(persona)
-            # Realtime outputs 24kHz mono PCM 16-bit
+            # Realtime outputs 24kHz mono PCM 16-bit.
             await websocket.send_text(json.dumps({
                 "type": "client_info",
                 "info": "did_talk_start",
                 "persona": persona,
                 "mode": "audio",
+                "provider": "runpod",
             }))
             result = await service.generate_talk_from_pcm(
-                pcm_bytes=pcm, sample_rate=24_000, persona_image_path=image_path
+                pcm_bytes=pcm,
+                sample_rate=24_000,
+                persona_image_path=image_path,
+                session_id=session_id,
+                persona=persona,
             )
             await websocket.send_text(json.dumps({
                 "type": "client_info",
                 "info": "did_talk_status",
                 "persona": persona,
                 "status": result.status,
+                "provider": "runpod",
             }))
             payload: dict[str, Any] = {
                 "type": "talk_video",
@@ -1220,88 +1187,6 @@ class RealtimeWebSocketManager:
                 logger.exception("Failed sending talk_error to client")
 
     # STT path intentionally removed in realtime-only flow
-
-    def _get_persona_voice_id(self, persona: str) -> str:
-        """Get the appropriate Microsoft voice ID for each persona."""
-        voice_mapping = {
-            "joi": "en-US-AriaNeural",  # Sophisticated, warm female voice
-            "officer_k": "en-US-GuyNeural",  # Deep, authoritative male voice
-            "officer_j": "en-US-JennyNeural",  # Clear, professional female voice
-        }
-        return voice_mapping.get(persona.lower(), "en-US-JennyNeural")
-
-    async def _create_talk_from_text_and_notify(self, session_id: str, text: str) -> None:
-        websocket = self.websockets.get(session_id)
-        persona = self.persona.get(session_id, "joi")
-        logger.info(f"[Session {session_id}] Starting D-ID talk generation for persona {persona}")
-
-        if websocket is None:
-            logger.error(f"[Session {session_id}] No websocket found, cannot notify client")
-            return
-
-        try:
-            # Resolve source URL from environment; required for text-mode
-            src = resolve_persona_source_url(persona)
-            logger.info(f"[Session {session_id}] Resolved source URL for {persona}: {src[:50] + '...' if src and len(src) > 50 else src}")
-
-            if not src:
-                logger.warning(f"[Session {session_id}] No source URL configured for persona {persona}, skipping text-based D-ID generation")
-                return
-
-            service = self._service()
-            voice_id = self._get_persona_voice_id(persona)
-            logger.info(f"[Session {session_id}] Using voice ID: {voice_id}")
-
-            # Notify client that video generation is starting
-            logger.info(f"[Session {session_id}] Notifying client that D-ID talk generation is starting")
-            await websocket.send_text(json.dumps({
-                "type": "client_info",
-                "info": "did_talk_start",
-                "persona": persona,
-                "mode": "text",
-            }))
-
-            logger.info(f"[Session {session_id}] Calling D-ID API with text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
-            result = await service.generate_talk_from_text(
-                source_url=src,
-                text=text,
-                voice_id=voice_id,
-                webhook=self._default_webhook,
-            )
-            logger.info(f"[Session {session_id}] D-ID generation completed with status: {result.status}, talk_id: {result.talk_id}")
-
-            # Notify client of generation status
-            logger.info(f"[Session {session_id}] Notifying client of D-ID status: {result.status}")
-            await websocket.send_text(json.dumps({
-                "type": "client_info",
-                "info": "did_talk_status",
-                "persona": persona,
-                "status": result.status,
-            }))
-
-            # Send the final video result
-            payload: dict[str, Any] = {
-                "type": "talk_video",
-                "persona": persona,
-                "talk_id": result.talk_id,
-                "status": result.status,
-                "url": result.result_url,
-            }
-            logger.info(f"[Session {session_id}] Sending video result: status={result.status}, url={result.result_url[:50] + '...' if result.result_url and len(result.result_url) > 50 else result.result_url}")
-            await websocket.send_text(json.dumps(payload))
-
-        except Exception as e:
-            logger.exception(f"[Session {session_id}] D-ID talk generation failed: {e}")
-            err_payload = {
-                "type": "talk_error",
-                "persona": persona,
-                "error": str(e),
-            }
-            try:
-                await websocket.send_text(json.dumps(err_payload))
-                logger.info(f"[Session {session_id}] Sent error notification to client")
-            except Exception as send_error:
-                logger.exception(f"[Session {session_id}] Failed sending talk_error to client (text mode): {send_error}")
 
 
 manager = RealtimeWebSocketManager()

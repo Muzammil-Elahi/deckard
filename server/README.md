@@ -1,22 +1,38 @@
-# Deckard Orchestrator Service (Skeleton)
+# Deckard Orchestrator Service
 
-This directory houses the FastAPI-based backend that will orchestrate voice input, OpenAI agent coordination, StableAvatar rendering, and web search integrations. The current contents are scaffolding generated from `docs/plan/agent-orchestration.md` and are intended to be fleshed out by the implementation phase.
+FastAPI backend for realtime conversation orchestration:
+- OpenAI Realtime + Agents SDK for voice/text/tool flows
+- RunPod-hosted lip-sync inference (MuseTalk-style handlers)
+- WebSocket bridge to the Next.js client (`web/src/app/page.tsx`)
 
-## Getting Started
-- Create a Python virtual environment (Python 3.11+ recommended).
-- Install dependencies once the `pyproject.toml`/`requirements` files are added.
-- Copy `.env.example` (to be created) into `.env.local` and populate OpenAI, RunPod, and Supabase credentials.
-- Launch the API with `uvicorn app.main:app --reload` after wiring up routers and services.
+## Local setup
+1. Create and activate a Python environment (Python 3.12+ recommended).
+2. Install dependencies:
+   ```bash
+   uv sync
+   ```
+3. Copy `server/.env.example` to `server/.env.local` and set:
+   - `OPENAI_API_KEY`
+   - `RUNPOD_API_KEY`
+   - `RUNPOD_ENDPOINT_ID` (or `RUNPOD_RUN_URL` + `RUNPOD_STATUS_URL_TEMPLATE`)
+4. Start the API:
+   ```bash
+   uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+   ```
 
-## Directory Guide
-- `app/main.py` – FastAPI entrypoint; register routers here.
-- `app/config.py` – Environment configuration helpers.
-- `app/routers/` – HTTP and WebSocket endpoints.
-- `app/services/` – Integrations for transcription, realtime voice, StableAvatar, and web search.
-- `app/agents/` – Agent wrappers built on `openai-agents-python`.
-- `app/models/` – Pydantic schemas for request/response contracts.
-- `tests/` – Pytest suite (expand with unit and integration coverage).
-- `tmp/` – Workdir for transient media artifacts (add cleanup strategy before production).
+## RunPod integration
+- The backend submits async jobs to RunPod Serverless v2 `/run`, then polls `/status/{job_id}`.
+- Expected handler output must include a video URL in one of:
+  - `output.video_url`
+  - `output.result_url`
+  - `output.url`
+- If no URL is returned, the backend emits `talk_error` to the client.
 
-## Next Steps
-Consult `docs/plan/agent-orchestration.md` for the detailed implementation checklist, including tooling decisions, deployment notes, and open questions.
+## Directory guide
+- `app/main.py` - realtime websocket manager and event serialization
+- `app/config.py` - environment-driven settings
+- `app/services/lipsync.py` - provider-agnostic lip-sync orchestration
+- `app/services/runpod.py` - RunPod HTTP client + status normalization
+- `app/services/audio_utils.py` - PCM/WAV conversion utilities
+- `app/ai_agents/` - OpenAI Agents SDK agent definitions
+- `tests/` - pytest coverage for service and agent behavior

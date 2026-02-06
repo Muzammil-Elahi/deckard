@@ -401,16 +401,16 @@ export default function Home() {
             if (coordinated) {
               logEvent('video', 'Coordinated video ready', `Video synchronized: ${url}`);
             } else {
-              logEvent('video', 'D-ID talk ready', url);
+              logEvent('video', 'Lip-sync video ready', url);
             }
           } else {
-            logEvent('video', 'D-ID talk status', String(event.status ?? 'unknown'));
+            logEvent('video', 'Lip-sync status', String(event.status ?? 'unknown'));
           }
           break;
         }
         case 'talk_error': {
-          const error = typeof event.error === 'string' ? event.error : 'Unknown D-ID error';
-          logEvent('error', 'D-ID talk failed', error, 'error');
+          const error = typeof event.error === 'string' ? event.error : 'Unknown lip-sync error';
+          logEvent('error', 'Lip-sync generation failed', error, 'error');
           break;
         }
         case 'history_updated': {
