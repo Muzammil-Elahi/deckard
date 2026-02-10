@@ -48,6 +48,25 @@ class RunPodJob:
     raw: Optional[dict[str, Any]] = None
 
 
+def is_runpod_configured(
+    *,
+    api_key: Optional[str] = None,
+    endpoint_id: Optional[str] = None,
+    run_url: Optional[str] = None,
+    status_url_template: Optional[str] = None,
+) -> bool:
+    """Return True if enough env is set to create a RunPodClient."""
+    key = (api_key or "").strip()
+    if not key:
+        return False
+    eid = (endpoint_id or "").strip() or None
+    run = (run_url or "").strip() or None
+    status = (status_url_template or "").strip() or None
+    if run and not status:
+        return False
+    return bool(eid or (run and status))
+
+
 def _coerce_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value

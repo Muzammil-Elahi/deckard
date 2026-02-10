@@ -174,8 +174,8 @@ class RealtimeWebSocketManager:
         self.active_response_texts: dict[str, list[str]] = {}  # session_id -> accumulating text parts
         self.active_response_ids: dict[str, str] = {}  # session_id -> current response_id
 
-        # Configuration flags
-        self.enable_response_buffering: bool = False  # Disabled for MVP to prioritize low-latency audio path.
+        # Configuration flags: when True, buffer assistant audio and send it with lip-sync video so avatar speaks in sync.
+        self.enable_response_buffering: bool = True
 
     def _service(self) -> LipSyncService:
         if self._lipsync_service is None:
@@ -465,13 +465,8 @@ class RealtimeWebSocketManager:
         buffer.complete_text = buffer.get_full_text()
         logger.info(f"[Session {session_id}] Added text to buffer, complete text: '{buffer.complete_text[:100]}{'...' if len(buffer.complete_text) > 100 else ''}'")
 
-        # Start video generation if not already started
-        if not buffer.video_generation_started:
-            buffer.video_generation_started = True
-            self._set_response_state(session_id, ResponseState.GENERATING_VIDEO)
-
-            # Start video generation in background
-            asyncio.create_task(self._generate_buffered_video(session_id, buffer))
+        # Video generation is started on audio_end when we have the full buffer (see _process_events).
+        # No need to start it here from text.
 
     def _coerce_to_dict(self, value: Any) -> dict[str, Any] | None:
         """Best-effort conversion of SDK response objects into plain dictionaries."""
@@ -589,15 +584,16 @@ class RealtimeWebSocketManager:
                 logger.info(f"[Session {session_id}] Video generation successful, coordinating playback")
                 await self._send_coordinated_response(session_id, buffer)
             else:
-                logger.error(f"[Session {session_id}] Video generation failed: {result.status}")
-                await self._send_buffered_response_error(session_id, f"Video generation failed: {result.status}")
+                reason = result.error or result.status
+                logger.error(f"[Session {session_id}] Video generation failed: {reason}")
+                await self._send_buffered_response_error(session_id, f"Video generation failed: {reason}")
 
         except Exception as e:
             logger.exception(f"[Session {session_id}] Video generation error: {e}")
             await self._send_buffered_response_error(session_id, str(e))
 
     async def _send_coordinated_response(self, session_id: str, buffer: ResponseBuffer) -> None:
-        """Send the coordinated audio and video response."""
+        """Send the coordinated audio and video response so the client can play them in sync."""
         websocket = self.websockets.get(session_id)
         if not websocket:
             return
@@ -605,7 +601,10 @@ class RealtimeWebSocketManager:
         self._set_response_state(session_id, ResponseState.READY)
         persona = self.persona.get(session_id, "joi")
 
-        # Send audio chunks for playback
+        # Tell the client to buffer incoming audio and play with video when talk_video arrives.
+        await websocket.send_text(json.dumps({"type": "client_info", "info": "coordinated_audio_start"}))
+
+        # Send audio chunks (client will buffer until talk_video, then play together).
         for chunk in buffer.audio_chunks:
             await websocket.send_text(json.dumps({
                 "type": "audio",
@@ -1007,17 +1006,22 @@ class RealtimeWebSocketManager:
             async for event in session:
                 # Intercept assistant audio stream and build a lip-sync video when the turn ends.
                 if event.type == "audio":
-                    # Check if we should use buffering for coordinated playback.
+                    # Check if we should use buffering for coordinated playback (avatar speaks in sync with audio).
                     if self.enable_response_buffering:
                         await self._handle_buffered_audio(session_id, event.audio.data)
                     else:
                         # Immediate mode: always accumulate assistant audio for post-turn lip-sync.
                         self.response_audio_buffers.setdefault(session_id, bytearray()).extend(event.audio.data)
                 elif event.type == "audio_end":
-                    pcm = bytes(self.response_audio_buffers.get(session_id, b""))
-                    self.response_audio_buffers[session_id] = bytearray()
-                    if pcm:
-                        asyncio.create_task(self._create_talk_and_notify(session_id, pcm))
+                    if self.enable_response_buffering:
+                        buffer = self._get_response_buffer(session_id)
+                        if buffer and buffer.audio_chunks:
+                            asyncio.create_task(self._generate_buffered_video(session_id, buffer))
+                    else:
+                        pcm = bytes(self.response_audio_buffers.get(session_id, b""))
+                        self.response_audio_buffers[session_id] = bytearray()
+                        if pcm:
+                            asyncio.create_task(self._create_talk_and_notify(session_id, pcm))
                 elif event.type == "history_added":
                     # Use history events for sentiment/mood tracking only.
                     logger.info(f"[Session {session_id}] Processing history_added event")
@@ -1077,6 +1081,10 @@ class RealtimeWebSocketManager:
                 elif event.type == "raw_model_event":
                     # Handle raw model events for response tracking
                     await self._handle_raw_model_event(session_id, event.data)
+
+                # When buffering for sync, do not forward audio/audio_end; client gets them in coordinated block.
+                if event.type in ("audio", "audio_end") and self.enable_response_buffering:
+                    continue
 
                 event_data = await self._serialize_event(event)
                 await websocket.send_text(json.dumps(event_data))
@@ -1167,14 +1175,22 @@ class RealtimeWebSocketManager:
                 "status": result.status,
                 "provider": "runpod",
             }))
-            payload: dict[str, Any] = {
-                "type": "talk_video",
-                "persona": persona,
-                "talk_id": result.talk_id,
-                "status": result.status,
-                "url": result.result_url,
-            }
-            await websocket.send_text(json.dumps(payload))
+            if result.result_url:
+                payload: dict[str, Any] = {
+                    "type": "talk_video",
+                    "persona": persona,
+                    "talk_id": result.talk_id,
+                    "status": result.status,
+                    "url": result.result_url,
+                }
+                await websocket.send_text(json.dumps(payload))
+            else:
+                err_payload = {
+                    "type": "talk_error",
+                    "persona": persona,
+                    "error": result.error or f"Lip-sync generation did not return a video URL (status={result.status}).",
+                }
+                await websocket.send_text(json.dumps(err_payload))
         except Exception as e:
             err_payload = {
                 "type": "talk_error",

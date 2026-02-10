@@ -63,7 +63,7 @@ async function prepareImageDataUrl(file: File): Promise<string> {
   }
   try {
     return await new Promise<string>((resolve) => {
-      const image = new Image();
+      const image = new window.Image();
       image.decoding = 'async';
       image.onload = () => {
         try {
@@ -164,6 +164,11 @@ export default function Home() {
   const streamRef = useRef<MediaStream | null>(null);
   const isCapturingRef = useRef(false);
   const isMutedRef = useRef(false);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const playbackCursorRef = useRef(0);
+  const playbackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const coordinatedAudioBufferRef = useRef<string[]>([]);
+  const isCoordinatedModeRef = useRef(false);
 
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -297,6 +302,75 @@ export default function Home() {
     return true;
   }, []);
 
+  const stopPlayback = useCallback(() => {
+    for (const source of playbackSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {}
+    }
+    playbackSourcesRef.current.clear();
+    playbackCursorRef.current = 0;
+    const context = playbackContextRef.current;
+    if (context) {
+      playbackContextRef.current = null;
+      context.close().catch(() => undefined);
+    }
+  }, []);
+
+  const playPcm16Base64 = useCallback(
+    async (base64Audio: string) => {
+      if (typeof window === 'undefined' || !base64Audio) {
+        return;
+      }
+      let context = playbackContextRef.current;
+      if (!context || context.state === 'closed') {
+        context = new AudioContext({ sampleRate: 24_000, latencyHint: 'interactive' });
+        playbackContextRef.current = context;
+        playbackCursorRef.current = context.currentTime;
+      }
+      if (context.state === 'suspended') {
+        try {
+          await context.resume();
+        } catch {}
+      }
+
+      try {
+        const binary = window.atob(base64Audio);
+        const byteLength = binary.length;
+        if (byteLength < 2 || byteLength % 2 !== 0) {
+          return;
+        }
+        const bytes = new Uint8Array(byteLength);
+        for (let i = 0; i < byteLength; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const view = new DataView(bytes.buffer);
+        const sampleCount = byteLength / 2;
+        const float32 = new Float32Array(sampleCount);
+        for (let i = 0; i < sampleCount; i += 1) {
+          const sample = view.getInt16(i * 2, true);
+          float32[i] = sample / 32768;
+        }
+
+        const buffer = context.createBuffer(1, sampleCount, 24_000);
+        buffer.copyToChannel(float32, 0);
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(context.destination);
+        const startAt = Math.max(context.currentTime + 0.01, playbackCursorRef.current || context.currentTime);
+        source.start(startAt);
+        playbackCursorRef.current = startAt + buffer.duration;
+        playbackSourcesRef.current.add(source);
+        source.onended = () => {
+          playbackSourcesRef.current.delete(source);
+        };
+      } catch (error) {
+        logEvent('media', 'Audio playback failed', error instanceof Error ? error.message : 'Invalid audio payload', 'warn');
+      }
+    },
+    [logEvent]
+  );
+
 
 
 
@@ -399,6 +473,13 @@ export default function Home() {
             setVideoUrl(url);
             setIsThinking(false);
             if (coordinated) {
+              // Play buffered audio in sync with video (chunks already queued in order via playbackCursorRef).
+              const chunks = coordinatedAudioBufferRef.current;
+              coordinatedAudioBufferRef.current = [];
+              isCoordinatedModeRef.current = false;
+              for (const chunk of chunks) {
+                void playPcm16Base64(chunk);
+              }
               logEvent('video', 'Coordinated video ready', `Video synchronized: ${url}`);
             } else {
               logEvent('video', 'Lip-sync video ready', url);
@@ -410,7 +491,27 @@ export default function Home() {
         }
         case 'talk_error': {
           const error = typeof event.error === 'string' ? event.error : 'Unknown lip-sync error';
+          setIsThinking(false);
           logEvent('error', 'Lip-sync generation failed', error, 'error');
+          break;
+        }
+        case 'audio': {
+          const payload = typeof event.audio === 'string' ? event.audio : null;
+          if (payload) {
+            if (isCoordinatedModeRef.current) {
+              coordinatedAudioBufferRef.current.push(payload);
+            } else {
+              void playPcm16Base64(payload);
+            }
+          }
+          break;
+        }
+        case 'audio_end': {
+          // Keep cursor near current clock to avoid unbounded drift over long sessions.
+          const context = playbackContextRef.current;
+          if (context) {
+            playbackCursorRef.current = Math.max(playbackCursorRef.current, context.currentTime);
+          }
           break;
         }
         case 'history_updated': {
@@ -477,6 +578,11 @@ export default function Home() {
           } else if (info === 'did_talk_start') {
             setIsThinking(true);
             logEvent('video', 'Video generation started');
+          } else if (info === 'coordinated_audio_start') {
+            isCoordinatedModeRef.current = true;
+            coordinatedAudioBufferRef.current = [];
+            setIsThinking(true);
+            logEvent('video', 'Coordinated playback', 'Buffering audio for sync');
           } else {
             logEvent('client', `Client info`, info);
           }
@@ -514,7 +620,7 @@ export default function Home() {
         }
       }
     },
-    [ingestHistory, ingestItem, logEvent, sendPayload]
+    [ingestHistory, ingestItem, logEvent, playPcm16Base64, sendPayload]
   );
 
   const openConnection = useCallback(() => {
@@ -568,9 +674,10 @@ export default function Home() {
       setIsConnecting(false);
       setStatusText('Disconnected');
       stopCapture();
+      stopPlayback();
       wsRef.current = null;
     };
-  }, [buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, persona, sendPayload, sessionId, startCapture, stopCapture, wsBase]);
+  }, [buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, persona, sendPayload, sessionId, startCapture, stopCapture, stopPlayback, wsBase]);
 
   const closeConnection = useCallback(() => {
     const ws = wsRef.current;
@@ -582,8 +689,9 @@ export default function Home() {
       setIsConnecting(false);
       setStatusText('Disconnected');
       stopCapture();
+      stopPlayback();
     }
-  }, [stopCapture]);
+  }, [stopCapture, stopPlayback]);
 
   const toggleMute = useCallback(() => {
     setIsMuted((prev) => {
@@ -595,10 +703,11 @@ export default function Home() {
 
   const interrupt = useCallback(() => {
     if (sendPayload({ type: 'interrupt' })) {
+      stopPlayback();
       setIsThinking(false);
       logEvent('session', 'Interrupt sent', 'Requested model to stop playback');
     }
-  }, [logEvent, sendPayload]);
+  }, [logEvent, sendPayload, stopPlayback]);
 
   const handleFileSelected = useCallback(
     async (file: File | null) => {
@@ -671,8 +780,9 @@ export default function Home() {
         ws.close();
       }
       stopCapture();
+      stopPlayback();
     };
-  }, [stopCapture]);
+  }, [stopCapture, stopPlayback]);
 
   const isMicLive = isCapturing && !isMuted;
 

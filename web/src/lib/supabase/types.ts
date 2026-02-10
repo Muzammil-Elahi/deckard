@@ -45,6 +45,7 @@ export type Database = {
           created_at?: string;
           updated_at?: string;
         };
+        Relationships: [];
       };
       media_assets: {
         Row: {
@@ -76,6 +77,7 @@ export type Database = {
           metadata?: Json | null;
           created_at?: string;
         };
+        Relationships: [];
       };
       processing_jobs: {
         Row: {
@@ -107,6 +109,7 @@ export type Database = {
           created_at?: string;
           updated_at?: string;
         };
+        Relationships: [];
       };
       conversations: {
         Row: {
@@ -132,6 +135,7 @@ export type Database = {
           created_at?: string;
           updated_at?: string;
         };
+        Relationships: [];
       };
       messages: {
         Row: {
@@ -160,6 +164,7 @@ export type Database = {
           latency_ms?: number | null;
           created_at?: string;
         };
+        Relationships: [];
       };
       memories: {
         Row: {
@@ -188,6 +193,7 @@ export type Database = {
           importance?: number | null;
           created_at?: string;
         };
+        Relationships: [];
       };
       session_events: {
         Row: {
@@ -213,6 +219,7 @@ export type Database = {
           payload?: Json | null;
           created_at?: string;
         };
+        Relationships: [];
       };
     };
     Views: {

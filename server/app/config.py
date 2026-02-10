@@ -28,6 +28,10 @@ class Settings:
     runpod_poll_interval_seconds: float = float(os.getenv("RUNPOD_POLL_INTERVAL_SECONDS", "0.75"))
     runpod_job_timeout_seconds: float = float(os.getenv("RUNPOD_JOB_TIMEOUT_SECONDS", "120"))
     lipsync_model_name: str = os.getenv("LIPSYNC_MODEL_NAME", "musetalk")
+    # Direct lip-sync URL (e.g. your own server on a GPU pod). No RunPod API needed.
+    # POST same payload as RunPod; response JSON with video_url/result_url/url.
+    lipsync_direct_url: Optional[str] = os.getenv("LIPSYNC_DIRECT_URL")
+    lipsync_direct_timeout_seconds: float = float(os.getenv("LIPSYNC_DIRECT_TIMEOUT_SECONDS", "120"))
 
     # Legacy runpod URL retained for backward compatibility with old docs.
     runpod_base_url: str = os.getenv("RUNPOD_BASE_URL", "https://runpod.example.com")

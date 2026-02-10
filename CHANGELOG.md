@@ -14,3 +14,10 @@ All notable changes to this project are documented in this file.
 - Updated `server/.env.example` and `server/README.md` with RunPod serverless configuration details.
 - Updated `server/app/ai_agents/transcribe_agent.py` and `server/tests/test_did_talks.py` to use shared `pcm16le_to_wav` utilities.
 - Updated Studio event labels in `web/src/app/page.tsx` from D-ID wording to provider-neutral lip-sync messaging.
+- Fixed Supabase typing for inserts/updates by adding `Relationships` metadata to table definitions in `web/src/lib/supabase/types.ts`.
+- Updated Supabase server client creation to support async `cookies()` in Next.js 15 and updated all callsites to await the client.
+- Fixed `Image` constructor shadowing in `web/src/app/page.tsx` by using `window.Image` for client-side image preprocessing.
+- Made browser Supabase client initialization non-fatal during build/prerender when env vars are missing, while preserving runtime guardrails.
+- Added frontend playback for realtime assistant `audio` chunks in `web/src/app/page.tsx`, including queueing and cleanup on interrupt/disconnect.
+- Improved lip-sync result parsing to accept additional output keys (`video`, `videoUrl`, base64 variants) and explicit unavailable-provider errors in `server/app/services/lipsync.py`.
+- Updated backend talk delivery to emit `talk_error` when lip-sync returns no video URL instead of silent empty `talk_video` payloads.
