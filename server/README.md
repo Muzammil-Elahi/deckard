@@ -15,10 +15,32 @@ FastAPI backend for realtime conversation orchestration:
    - `OPENAI_API_KEY`
    - `RUNPOD_API_KEY`
    - `RUNPOD_ENDPOINT_ID` (or `RUNPOD_RUN_URL` + `RUNPOD_STATUS_URL_TEMPLATE`)
+   - Optional direct mode:
+     - `LIPSYNC_DIRECT_URL` (example: `http://127.0.0.1:8001/generate`)
 4. Start the API:
    ```bash
    uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
+
+## Co-Located Lip-Sync Server (Same GPU Pod)
+If you are running Deckard on a RunPod GPU pod and want the lip-sync model on the same machine:
+
+1. Start Deckard backend (WebSocket + orchestration) on `:8000`:
+   ```bash
+   uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+   ```
+2. Start the lip-sync server on `:8001`:
+   ```bash
+   # Backend selection:
+   # - noop (default): returns a clear error until you configure a model
+   # - wav2lip: shells out to a local Wav2Lip checkout
+   export LIPSYNC_SERVER_BACKEND=wav2lip
+   export WAV2LIP_REPO_DIR=/workspace/Wav2Lip
+   export WAV2LIP_CHECKPOINT_PATH=/workspace/wav2lip_gan.pth
+   uv run uvicorn app.lipsync_server.main:app --host 0.0.0.0 --port 8001
+   ```
+3. Point Deckard to the local server (lowest latency):
+   - `LIPSYNC_DIRECT_URL=http://127.0.0.1:8001/generate`
 
 ## RunPod integration
 - The backend submits async jobs to RunPod Serverless v2 `/run`, then polls `/status/{job_id}`.

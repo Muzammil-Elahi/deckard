@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 - Added reusable audio conversion helpers in `server/app/services/audio_utils.py`.
 - Added a RunPod API client in `server/app/services/runpod.py` with config validation, timeout handling, and status normalization.
 - Added tests for lip-sync service and RunPod config behavior in `server/tests/test_lipsync.py`.
+- Added a co-located lip-sync HTTP server in `server/app/lipsync_server/` (port `8001`) with a pluggable backend and a Wav2Lip subprocess option for GPU pods.
 
 ### Changed
 - Replaced active D-ID generation calls in `server/app/main.py` with RunPod lip-sync generation while preserving frontend event compatibility.
