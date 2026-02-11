@@ -9,8 +9,13 @@ All notable changes to this project are documented in this file.
 - Added a RunPod API client in `server/app/services/runpod.py` with config validation, timeout handling, and status normalization.
 - Added tests for lip-sync service and RunPod config behavior in `server/tests/test_lipsync.py`.
 - Added a co-located lip-sync HTTP server in `server/app/lipsync_server/` (port `8001`) with a pluggable backend and a Wav2Lip subprocess option for GPU pods.
+- Added low-latency conversational memory in `server/app/services/memory.py` with local-first recall, optional Supabase persistence, and realtime context injection.
+- Added memory service tests in `server/tests/test_memory.py`.
+- Added onboarding and operations documentation in `docs/DEVELOPER_GUIDE.md`, `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `docs/README.md`.
+- Added a new developer onboarding checklist to `AGENTS.md` for faster contributor ramp-up.
 
 ### Changed
+- Replaced the stale root README with a current setup/status guide aligned to the active OpenAI Realtime + self-hosted lip-sync architecture.
 - Replaced active D-ID generation calls in `server/app/main.py` with RunPod lip-sync generation while preserving frontend event compatibility.
 - Updated `server/.env.example` and `server/README.md` with RunPod serverless configuration details.
 - Updated `server/app/ai_agents/transcribe_agent.py` and `server/tests/test_did_talks.py` to use shared `pcm16le_to_wav` utilities.
@@ -22,3 +27,4 @@ All notable changes to this project are documented in this file.
 - Added frontend playback for realtime assistant `audio` chunks in `web/src/app/page.tsx`, including queueing and cleanup on interrupt/disconnect.
 - Improved lip-sync result parsing to accept additional output keys (`video`, `videoUrl`, base64 variants) and explicit unavailable-provider errors in `server/app/services/lipsync.py`.
 - Updated backend talk delivery to emit `talk_error` when lip-sync returns no video URL instead of silent empty `talk_video` payloads.
+- Updated websocket connect URL handling in `web/src/app/page.tsx` and `server/app/main.py` to support a stable `memory_key` for cross-session personalization.

@@ -140,6 +140,7 @@ function parseHistoryMessageItem(item: unknown): ConversationMessage | null {
 
 export default function Home() {
   const [sessionId, setSessionId] = useState<string>('');
+  const [memoryKey, setMemoryKey] = useState<string>('');
   const [persona, setPersona] = useState<PersonaKey>('joi');
   const [thinkingVideo, setThinkingVideo] = useState<string>(PERSONA_DEFAULT_THINKING_VIDEO['joi']);
   const [videoUrl, setVideoUrl] = useState<string>('');
@@ -147,15 +148,34 @@ export default function Home() {
     // Generate a stable client-only session id to avoid SSR/client mismatch
     setSessionId(randomId('session'));
   }, []);
+  useEffect(() => {
+    // Stable per-browser memory key lets backend persist lightweight personalization.
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const storageKey = 'deckard_memory_key';
+    const stored = window.localStorage.getItem(storageKey);
+    if (stored && stored.trim()) {
+      setMemoryKey(stored.trim());
+      return;
+    }
+    const generated = randomId('memory');
+    window.localStorage.setItem(storageKey, generated);
+    setMemoryKey(generated);
+  }, []);
   const wsBase = useMemo(() => {
     const value = DEFAULT_WS_BASE.trim();
     return value.endsWith('/') ? value.slice(0, -1) : value;
   }, []);
 
-  const buildWsUrl = useCallback((base: string, id: string) => {
+  const buildWsUrl = useCallback((base: string, id: string, key?: string) => {
     let b = base.trim();
     if (b.endsWith('/')) b = b.slice(0, -1);
-    return b.endsWith('/ws') ? `${b}/${id}` : `${b}/ws/${id}`;
+    const core = b.endsWith('/ws') ? `${b}/${id}` : `${b}/ws/${id}`;
+    if (!key || !key.trim()) {
+      return core;
+    }
+    return `${core}?memory_key=${encodeURIComponent(key.trim())}`;
   }, []);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -627,12 +647,19 @@ export default function Home() {
     if (isConnecting || isConnected) {
       return;
     }
-    setStatusText('Connecting…');
+    setStatusText('Connecting...');
     setIsConnecting(true);
     setLastError(null);
+    const effectiveMemoryKey = memoryKey || randomId('memory');
+    if (!memoryKey) {
+      setMemoryKey(effectiveMemoryKey);
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem('deckard_memory_key', effectiveMemoryKey);
+      }
+    }
     const effectiveId = sessionId || randomId('session');
     if (!sessionId) setSessionId(effectiveId);
-    const url = buildWsUrl(wsBase, effectiveId);
+    const url = buildWsUrl(wsBase, effectiveId, effectiveMemoryKey);
     const socket = new WebSocket(url);
     wsRef.current = socket;
     logEvent('session', 'Connecting', `Dialing ${url}`);
@@ -677,7 +704,7 @@ export default function Home() {
       stopPlayback();
       wsRef.current = null;
     };
-  }, [buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, persona, sendPayload, sessionId, startCapture, stopCapture, stopPlayback, wsBase]);
+  }, [buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, memoryKey, persona, sendPayload, sessionId, startCapture, stopCapture, stopPlayback, wsBase]);
 
   const closeConnection = useCallback(() => {
     const ws = wsRef.current;
@@ -1119,7 +1146,7 @@ export default function Home() {
                 <div className="rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
                   <span className="text-[0.55rem] font-semibold uppercase tracking-[0.4em] text-stone-500">Realtime Endpoint</span>
                   <span className="mt-2 block truncate text-sm text-stone-200" suppressHydrationWarning>
-                    {sessionId ? buildWsUrl(wsBase, sessionId) : `${wsBase}/ws/{pending}`}
+                    {sessionId ? buildWsUrl(wsBase, sessionId, memoryKey) : `${wsBase}/ws/{pending}`}
                   </span>
                 </div>
               </div>

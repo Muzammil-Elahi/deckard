@@ -4,6 +4,7 @@ FastAPI backend for realtime conversation orchestration:
 - OpenAI Realtime + Agents SDK for voice/text/tool flows
 - RunPod-hosted lip-sync inference (MuseTalk-style handlers)
 - WebSocket bridge to the Next.js client (`web/src/app/page.tsx`)
+- Low-latency memory and personalization hooks via `memory_key`
 
 ## Local setup
 1. Create and activate a Python environment (Python 3.12+ recommended).
@@ -21,6 +22,12 @@ FastAPI backend for realtime conversation orchestration:
    ```bash
    uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
+
+## Websocket memory key
+- Endpoint: `/ws/{session_id}?memory_key={stable_user_key}`
+- If `memory_key` is provided, server memory recall/persistence uses it as the identity key.
+- If omitted, `session_id` is used as fallback.
+- Memory writes are asynchronous and should not block the realtime loop.
 
 ## Co-Located Lip-Sync Server (Same GPU Pod)
 If you are running Deckard on a RunPod GPU pod and want the lip-sync model on the same machine:
@@ -55,6 +62,8 @@ If you are running Deckard on a RunPod GPU pod and want the lip-sync model on th
 - `app/config.py` - environment-driven settings
 - `app/services/lipsync.py` - provider-agnostic lip-sync orchestration
 - `app/services/runpod.py` - RunPod HTTP client + status normalization
+- `app/services/memory.py` - local-first conversational memory + optional Supabase sync
 - `app/services/audio_utils.py` - PCM/WAV conversion utilities
 - `app/ai_agents/` - OpenAI Agents SDK agent definitions
+- `app/lipsync_server/` - optional local inference API for same-pod deployments
 - `tests/` - pytest coverage for service and agent behavior

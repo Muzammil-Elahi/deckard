@@ -73,6 +73,7 @@ from app.services.lipsync import (
     LipSyncService,
     resolve_persona_image,
 )
+from app.services.memory import ConversationMemoryService
 
 
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
@@ -151,7 +152,17 @@ class ResponseBuffer:
 
 
 class RealtimeWebSocketManager:
+    """Owns realtime session lifecycle, media buffering, and avatar generation flow.
+
+    Mental model:
+    - one websocket client maps to one `session_id`
+    - one OpenAI realtime session is created per websocket session
+    - assistant audio is buffered until turn end, then converted into a lip-sync video
+    - memory is best-effort and latency bounded so it does not block conversation
+    """
+
     def __init__(self):
+        # Core realtime session plumbing
         self.active_sessions: dict[str, RealtimeSession] = {}
         self.session_contexts: dict[str, Any] = {}
         self.websockets: dict[str, WebSocket] = {}
@@ -162,8 +173,13 @@ class RealtimeWebSocketManager:
         self.last_sentiment: dict[str, str] = {}
         self.persona_videos: dict[str, str] = {}
         self._event_tasks: dict[str, asyncio.Task] = {}
-        # Service instance (lazy)
+        # Service singletons (lazy initialized)
         self._lipsync_service: LipSyncService | None = None
+        self._memory_service: ConversationMemoryService | None = None
+        # Session -> stable memory identity. Defaults to session_id when not provided by client.
+        self.memory_keys: dict[str, str] = {}
+        # Last injected memory summary to avoid repeatedly sending the same context.
+        self._last_memory_context: dict[str, str] = {}
 
         # New response buffering system
         self.response_buffers: dict[str, ResponseBuffer] = {}  # session_id -> current response buffer
@@ -174,7 +190,8 @@ class RealtimeWebSocketManager:
         self.active_response_texts: dict[str, list[str]] = {}  # session_id -> accumulating text parts
         self.active_response_ids: dict[str, str] = {}  # session_id -> current response_id
 
-        # Configuration flags: when True, buffer assistant audio and send it with lip-sync video so avatar speaks in sync.
+        # When True, client receives coordinated audio+video after video is ready.
+        # This improves realism (lip-sync quality) at the cost of waiting until video generation finishes.
         self.enable_response_buffering: bool = True
 
     def _service(self) -> LipSyncService:
@@ -190,10 +207,90 @@ class RealtimeWebSocketManager:
                 raise
         return self._lipsync_service
 
+    def _memory(self) -> ConversationMemoryService:
+        if self._memory_service is None:
+            self._memory_service = ConversationMemoryService()
+        return self._memory_service
 
-    async def connect(self, websocket: WebSocket, session_id: str):
+    def _memory_key_for_session(self, session_id: str) -> str:
+        return self.memory_keys.get(session_id, session_id)
+
+    async def _remember_message(self, session_id: str, *, role: str, text: str) -> None:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return
+        memory_key = self._memory_key_for_session(session_id)
+        persona = self.persona.get(session_id, "joi")
+        try:
+            await self._memory().remember(
+                memory_key=memory_key,
+                role=role,
+                text=cleaned,
+                persona=persona,
+            )
+        except Exception as exc:
+            logger.debug("[Session %s] Memory write skipped: %s", session_id, exc)
+
+    async def _inject_memory_context(
+        self,
+        session_id: str,
+        *,
+        prompt: str = "",
+        include_remote: bool = False,
+    ) -> None:
+        """Inject compact memory context as a system message before a turn.
+
+        Keep this short and deduplicated to avoid token bloat and added latency.
+        """
+        if session_id not in self.active_sessions:
+            return
+        memory_key = self._memory_key_for_session(session_id)
+        try:
+            summary = await self._memory().recall_summary(
+                memory_key=memory_key,
+                prompt=prompt,
+                include_remote=include_remote,
+                max_items=4,
+                max_chars=650,
+            )
+        except Exception as exc:
+            logger.debug("[Session %s] Memory recall skipped: %s", session_id, exc)
+            return
+        if not summary:
+            return
+        if summary == self._last_memory_context.get(session_id):
+            return
+
+        memory_system_msg: RealtimeUserInputMessage = {
+            "type": "message",
+            "role": "system",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Use this prior conversation memory only when relevant. "
+                        "If it conflicts with the user's newest request, prefer the newest request.\n"
+                        f"{summary}"
+                    ),
+                }
+            ],
+        }
+        await self.send_user_message(session_id, memory_system_msg)
+        self._last_memory_context[session_id] = summary
+
+
+    async def connect(
+        self,
+        websocket: WebSocket,
+        session_id: str,
+        *,
+        memory_key: Optional[str] = None,
+    ):
+        """Accept websocket, initialize realtime agent session, and prime memory context."""
         await websocket.accept()
         self.websockets[session_id] = websocket
+        chosen_memory_key = (memory_key or "").strip() or session_id
+        self.memory_keys[session_id] = chosen_memory_key
 
         agent = get_starting_agent()
         runner = RealtimeRunner(agent)
@@ -207,12 +304,21 @@ class RealtimeWebSocketManager:
         self.last_sentiment.setdefault(session_id, "neutral")
 
         await self.send_persona_mood_update(session_id)
+        # Prime memory with remote context once per connection.
+        try:
+            await asyncio.wait_for(
+                self._inject_memory_context(session_id, include_remote=True),
+                timeout=0.35,
+            )
+        except Exception:
+            pass
 
         # Start event processing task
         task = asyncio.create_task(self._process_events(session_id), name=f"deckard-process-events-{session_id}")
         self._event_tasks[session_id] = task
 
     async def disconnect(self, session_id: str):
+        """Tear down all per-session resources, including async background tasks."""
         if session_id in self.session_contexts:
             await self.session_contexts[session_id].__aexit__(None, None, None)
             del self.session_contexts[session_id]
@@ -224,6 +330,8 @@ class RealtimeWebSocketManager:
         self.persona.pop(session_id, None)
         self.last_sentiment.pop(session_id, None)
         self.persona_videos.pop(session_id, None)
+        self.memory_keys.pop(session_id, None)
+        self._last_memory_context.pop(session_id, None)
 
         task = self._event_tasks.pop(session_id, None)
         if task:
@@ -257,7 +365,7 @@ class RealtimeWebSocketManager:
         )
 
     async def send_user_message(self, session_id: str, message: RealtimeUserInputMessage):
-        """Send a structured user message via the higher-level API (supports input_image)."""
+        """Send a structured conversation message via the higher-level API."""
         session = self.active_sessions.get(session_id)
         if not session:
             return
@@ -369,6 +477,7 @@ class RealtimeWebSocketManager:
         if not text:
             return
 
+        asyncio.create_task(self._remember_message(session_id, role="user", text=text))
         sentiment = await self._classify_sentiment(text)
         logger.info(
             f"[Session {session_id}] Classified user sentiment as '{sentiment}'"
@@ -998,6 +1107,14 @@ class RealtimeWebSocketManager:
         await self.send_persona_mood_update(session_id, sentiment=sentiment)
 
     async def _process_events(self, session_id: str):
+        """Bridge OpenAI realtime events -> frontend events and backend side effects.
+
+        Side effects handled here:
+        - buffering assistant audio chunks
+        - triggering lip-sync generation at turn end
+        - sentiment updates from history events
+        - optional forwarding of raw model events for client diagnostics
+        """
         task = asyncio.current_task()
         try:
             session = self.active_sessions[session_id]
@@ -1062,6 +1179,13 @@ class RealtimeWebSocketManager:
                             if full_text:
                                 persona = self.persona.get(session_id, "joi")
                                 logger.info(f"[Session {session_id}] Current persona: {persona}")
+                                asyncio.create_task(
+                                    self._remember_message(
+                                        session_id,
+                                        role="assistant",
+                                        text=full_text,
+                                    )
+                                )
 
                                 # Classify sentiment of assistant message to update mood
                                 sentiment = await self._classify_sentiment(full_text)
@@ -1218,7 +1342,10 @@ app = FastAPI(lifespan=lifespan)
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    await manager.connect(websocket, session_id)
+    # `memory_key` lets clients keep personalization stable across reconnects.
+    # If omitted, manager falls back to session_id-scoped memory.
+    memory_key = websocket.query_params.get("memory_key")
+    await manager.connect(websocket, session_id, memory_key=memory_key)
     image_buffers: dict[str, dict[str, Any]] = {}
     try:
         while True:
@@ -1274,6 +1401,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     )
             elif message["type"] == "commit_audio":
                 # Force close the current input audio turn
+                try:
+                    await asyncio.wait_for(
+                        manager._inject_memory_context(session_id, include_remote=False),
+                        timeout=0.2,
+                    )
+                except Exception:
+                    pass
                 await manager.send_client_event(session_id, {"type": "input_audio_buffer.commit"})
             elif message["type"] == "image_start":
                 img_id = str(message.get("id"))

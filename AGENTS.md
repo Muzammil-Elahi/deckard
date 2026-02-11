@@ -23,3 +23,15 @@ Always add descriptive title and description to the PR.
 
 ## CHANGELOG Guidelines
 Always add a changelog entry to the CHANGELOG.md file.
+
+## New Developer Quickstart Checklist
+1. Read `README.md`, `docs/DEVELOPER_GUIDE.md`, and `docs/ARCHITECTURE.md` before making code changes.
+2. Confirm local prerequisites: Python 3.12+, Node 18+, `uv`, and npm are installed.
+3. Start backend from `server/` and frontend from `web/` and verify the websocket flow works end-to-end.
+4. If using a GPU pod, verify `LIPSYNC_DIRECT_URL` and lip-sync health before debugging frontend playback.
+5. Run validation before committing:
+   - `cd server && uv run pytest`
+   - `cd web && npm run lint`
+   - `cd web && npm run build`
+6. Update `CHANGELOG.md` for every change set.
+7. For PRs, include a clear title, description, test/lint/build status, and screenshots for UI changes.
