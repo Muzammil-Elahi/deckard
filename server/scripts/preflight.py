@@ -45,6 +45,7 @@ class Report:
 
 
 def _load_environment() -> None:
+    """Load local env files in precedence order without overwriting existing vars."""
     script_dir = Path(__file__).resolve().parent
     server_dir = script_dir.parent
     repo_dir = server_dir.parent
@@ -59,11 +60,13 @@ def _load_environment() -> None:
 
 
 def _is_valid_http_url(value: str) -> bool:
+    """Return True when value is an absolute HTTP(S) URL."""
     parsed = urlparse((value or "").strip())
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def _env_int(name: str, default: int, report: Report, *, minimum: int = 1) -> int:
+    """Parse int env var and emit validation failures into the report."""
     raw = os.getenv(name, str(default)).strip()
     try:
         value = int(raw)
@@ -76,6 +79,7 @@ def _env_int(name: str, default: int, report: Report, *, minimum: int = 1) -> in
 
 
 def _env_float(name: str, default: float, report: Report, *, minimum: float = 0.0) -> float:
+    """Parse float env var and emit validation failures into the report."""
     raw = os.getenv(name, str(default)).strip()
     try:
         value = float(raw)
@@ -88,6 +92,7 @@ def _env_float(name: str, default: float, report: Report, *, minimum: float = 0.
 
 
 def _mask(value: str) -> str:
+    """Mask secret values for safe console output."""
     trimmed = value.strip()
     if len(trimmed) < 8:
         return "***"
@@ -95,6 +100,7 @@ def _mask(value: str) -> str:
 
 
 def check_core_env(report: Report) -> None:
+    """Validate core runtime requirements shared by all deployment modes."""
     openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not openai_key:
         report.fail("OPENAI_API_KEY is required.")
@@ -113,6 +119,7 @@ def check_core_env(report: Report) -> None:
 
 
 def check_lipsync_provider(report: Report) -> tuple[str, str | None]:
+    """Validate that at least one lip-sync provider is correctly configured."""
     direct_url = (os.getenv("LIPSYNC_DIRECT_URL") or "").strip()
     runpod_key = (os.getenv("RUNPOD_API_KEY") or "").strip()
     endpoint_id = (os.getenv("RUNPOD_ENDPOINT_ID") or "").strip()
@@ -158,6 +165,7 @@ def check_lipsync_provider(report: Report) -> tuple[str, str | None]:
 
 
 def check_memory_guardrails(report: Report) -> None:
+    """Validate memory-related guardrail values and flag suspicious combinations."""
     max_local = _env_int("MEMORY_MAX_LOCAL_ENTRIES", 80, report)
     max_recall = _env_int("MEMORY_MAX_RECALL_ITEMS", 5, report)
     _env_int("MEMORY_MAX_SUMMARY_CHARS", 650, report, minimum=120)
@@ -177,7 +185,49 @@ def check_memory_guardrails(report: Report) -> None:
     report.ok("Memory guardrail settings parsed successfully.")
 
 
+def check_lipsync_optimization(report: Report) -> None:
+    """Validate performance tuning knobs for the lip-sync inference path."""
+    poll = _env_float("RUNPOD_POLL_INTERVAL_SECONDS", 0.4, report, minimum=0.1)
+    if poll > 1.0:
+        report.warn(
+            "RUNPOD_POLL_INTERVAL_SECONDS is high; completed jobs may take longer to surface."
+        )
+
+    preferred_path = (os.getenv("LIPSYNC_DIRECT_PREFERRED_PATH", "/generate") or "").strip()
+    if preferred_path and not preferred_path.startswith("/"):
+        report.fail("LIPSYNC_DIRECT_PREFERRED_PATH must start with '/'.")
+    else:
+        report.ok(f"LIPSYNC_DIRECT_PREFERRED_PATH={preferred_path or '/generate'}")
+
+    trim_silence = (os.getenv("LIPSYNC_TRIM_SILENCE", "true") or "").strip().lower()
+    trim_enabled = trim_silence not in {"0", "false", "no", "off"}
+    if not trim_enabled:
+        report.warn("LIPSYNC_TRIM_SILENCE is disabled; payloads may be larger and slower.")
+    else:
+        report.ok("LIPSYNC_TRIM_SILENCE enabled.")
+
+    threshold = _env_int("LIPSYNC_SILENCE_THRESHOLD", 500, report, minimum=0)
+    if threshold > 3000:
+        report.warn(
+            "LIPSYNC_SILENCE_THRESHOLD is very high; quiet speech may be trimmed too aggressively."
+        )
+
+    pad_ms = _env_int("LIPSYNC_SILENCE_PAD_MS", 120, report, minimum=0)
+    if pad_ms > 500:
+        report.warn(
+            "LIPSYNC_SILENCE_PAD_MS is high; optimization impact will be reduced."
+        )
+
+    max_audio_seconds = _env_float("LIPSYNC_MAX_AUDIO_SECONDS", 0, report, minimum=0.0)
+    if 0 < max_audio_seconds < 2.0:
+        report.warn(
+            "LIPSYNC_MAX_AUDIO_SECONDS is very low; responses may be truncated."
+        )
+    report.ok("Lip-sync optimization settings parsed successfully.")
+
+
 def check_secret_hygiene(report: Report) -> None:
+    """Run lightweight secret safety checks for common local misconfigurations."""
     repo_dir = Path(__file__).resolve().parents[2]
     if (repo_dir / ".env").exists():
         report.warn("Root .env detected. Ensure it is local-only and gitignored.")
@@ -198,6 +248,7 @@ def check_secret_hygiene(report: Report) -> None:
 
 
 def _probe(url: str, *, timeout_seconds: float) -> tuple[bool, str]:
+    """Probe URL reachability and return (ok, message)."""
     try:
         with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
             response = client.get(url)
@@ -209,6 +260,7 @@ def _probe(url: str, *, timeout_seconds: float) -> tuple[bool, str]:
 
 
 def _health_candidates(direct_url: str) -> Iterable[str]:
+    """Generate health probe candidates for direct lip-sync URLs."""
     trimmed = direct_url.rstrip("/")
     parsed = urlparse(trimmed)
     if parsed.path in {"", "/"}:
@@ -217,6 +269,7 @@ def _health_candidates(direct_url: str) -> Iterable[str]:
 
 
 def check_http_health(report: Report, *, provider: str, provider_url: str | None, timeout_seconds: float) -> None:
+    """Optionally run live HTTP checks against direct-mode lip-sync endpoints."""
     if provider != "direct" or not provider_url:
         report.warn("HTTP health check currently validates only LIPSYNC_DIRECT_URL mode.")
         return
@@ -232,6 +285,7 @@ def check_http_health(report: Report, *, provider: str, provider_url: str | None
 
 
 def print_report(report: Report) -> None:
+    """Render a human-readable summary report to stdout."""
     for message in report.passed:
         print(f"[PASS] {message}")
     for message in report.warnings:
@@ -244,6 +298,7 @@ def print_report(report: Report) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for optional network checks and probe timeouts."""
     parser = argparse.ArgumentParser(description="Deckard backend preflight checks")
     parser.add_argument(
         "--check-http",
@@ -260,6 +315,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Run preflight suite and return process exit code."""
     args = parse_args()
     _load_environment()
     report = Report()
@@ -267,6 +323,7 @@ def main() -> int:
     check_core_env(report)
     provider, provider_url = check_lipsync_provider(report)
     check_memory_guardrails(report)
+    check_lipsync_optimization(report)
     check_secret_hygiene(report)
     if args.check_http:
         check_http_health(

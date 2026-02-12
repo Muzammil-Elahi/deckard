@@ -78,6 +78,21 @@ If you are running Deckard on a RunPod GPU pod and want the lip-sync model on th
   - `output.url`
 - If no URL is returned, the backend emits `talk_error` to the client.
 
+## Latency tuning
+For lower lip-sync turnaround on GPU pods:
+- Set `RESPONSE_MODE_DEFAULT=fast` to stream assistant audio immediately while video is generated.
+- Use direct mode when possible:
+  - `LIPSYNC_DIRECT_URL=http://127.0.0.1:8001/generate`
+  - `LIPSYNC_DIRECT_PREFERRED_PATH=/generate`
+- Keep silence trimming enabled:
+  - `LIPSYNC_TRIM_SILENCE=true`
+  - `LIPSYNC_SILENCE_THRESHOLD=500`
+  - `LIPSYNC_SILENCE_PAD_MS=120`
+- Reduce serverless polling latency:
+  - `RUNPOD_POLL_INTERVAL_SECONDS=0.4`
+- Optional hard cap for long turns:
+  - `LIPSYNC_MAX_AUDIO_SECONDS=0` (disabled by default; set >0 only if you need strict latency caps).
+
 ## Directory guide
 - `app/main.py` - realtime websocket manager and event serialization
 - `app/config.py` - environment-driven settings

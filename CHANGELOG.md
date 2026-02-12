@@ -18,6 +18,7 @@ All notable changes to this project are documented in this file.
 - Added image-upload guardrails in `web/src/app/page.tsx` (type/size validation, upload progress feedback, and keyboard shortcuts).
 - Added accessibility enhancements in `web/src/app/page.tsx` including `aria-live` status announcements and assertive error alerts.
 - Added typed chat composition in the left conversation panel (`web/src/app/page.tsx`) so users can send text prompts directly to the realtime session.
+- Added PCM silence-trimming utility in `server/app/services/audio_utils.py` and wired it into lip-sync request preparation to reduce payload size and inference latency.
 
 ### Changed
 - Replaced the stale root README with a current setup/status guide aligned to the active OpenAI Realtime + self-hosted lip-sync architecture.
@@ -39,3 +40,8 @@ All notable changes to this project are documented in this file.
 - Updated `server/.env.example` and `server/README.md` with response mode defaults, memory/safety guardrail env vars, and the new preflight workflow.
 - Updated `server/app/main.py` and `server/app/services/memory.py` with response mode switching, secret-safety startup checks, TTL/dedupe memory controls, and bounded memory recall summarization.
 - Updated websocket message handling in `server/app/main.py` to accept `text` payloads and enqueue them as structured realtime user messages, enabling typed turns that still produce text/audio/lip-sync outputs.
+- Optimized lip-sync transport in `server/app/services/lipsync.py` with direct-route preference/caching, shared keep-alive HTTP clients, and persona image byte caching.
+- Optimized RunPod API transport in `server/app/services/runpod.py` by reusing a persistent async HTTP client instead of creating a new client per request.
+- Updated `server/.env.example`, `server/README.md`, and `server/scripts/preflight.py` with latency-tuning knobs (`LIPSYNC_DIRECT_PREFERRED_PATH`, silence trimming controls, and faster polling defaults).
+- Updated lip-sync tests in `server/tests/test_lipsync.py` to match optimized direct-route ordering and added silence-trimming coverage.
+- Expanded inline comments/docstrings across recent backend/frontend additions (`lipsync`, `runpod`, `preflight`, websocket handlers, and Studio event flow) to improve new developer onboarding speed.

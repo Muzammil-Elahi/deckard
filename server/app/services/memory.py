@@ -107,6 +107,7 @@ class ConversationMemoryService:
         self._prune_local(key, now=now)
         signature = cleaned.lower()
         last_seen = self._recent_signatures[key].get(signature)
+        # Skip near-duplicate writes in a short window to avoid noisy memory drift.
         if last_seen is not None and (now - last_seen) < self._dedupe_window_seconds:
             return
         self._recent_signatures[key][signature] = now
@@ -197,6 +198,7 @@ class ConversationMemoryService:
         top_n = max_items if max_items is not None else self._max_recall_items
         selected = ranked[: max(1, top_n)]
 
+        # Bound recall output so memory injection cannot balloon prompt size/latency.
         summary_limit = max(120, min(max_chars, self._max_summary_chars))
         lines: list[str] = []
         total_chars = 0

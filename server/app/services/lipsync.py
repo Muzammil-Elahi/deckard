@@ -9,7 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from app.config import settings
-from app.services.audio_utils import pcm16le_to_wav
+from app.services.audio_utils import pcm16le_to_wav, trim_pcm16le_silence
 from app.services.runpod import (
     RunPodClient,
     RunPodClientConfigError,
@@ -57,7 +57,18 @@ def resolve_persona_image(persona: str) -> Path:
 
 
 class LipSyncService:
-    """Lip-sync service: direct HTTP URL (your GPU server) or RunPod Serverless."""
+    """Provider-agnostic lip-sync orchestrator.
+
+    Resolution order:
+    1. Direct mode (`LIPSYNC_DIRECT_URL`) for colocated GPU inference
+    2. RunPod serverless mode
+
+    Performance-sensitive behavior in this class:
+    - Reuses persistent HTTP clients (keep-alive)
+    - Caches avatar image bytes
+    - Trims leading/trailing silence before inference
+    - Remembers the last successful direct route to avoid route probing on every turn
+    """
 
     def __init__(
         self,
@@ -82,6 +93,18 @@ class LipSyncService:
         self._model_name = model_name
         self._max_pcm_bytes = max_pcm_bytes
         self._max_image_bytes = max_image_bytes
+        self._trim_silence = settings.lipsync_trim_silence
+        self._silence_threshold = max(0, settings.lipsync_silence_threshold)
+        self._silence_pad_ms = max(0, settings.lipsync_silence_pad_ms)
+        self._max_audio_seconds = max(0.0, settings.lipsync_max_audio_seconds)
+        self._direct_preferred_path = (
+            settings.lipsync_direct_preferred_path.strip()
+            if settings.lipsync_direct_preferred_path
+            else "/generate"
+        )
+        self._last_successful_direct_url: Optional[str] = None
+        self._direct_http_client: Optional[httpx.AsyncClient] = None
+        self._persona_image_cache: dict[Path, tuple[bytes, str]] = {}
         # Explicit injected client is highest precedence (e.g. tests/fakes).
         if client is not None:
             self._direct_url = None
@@ -119,6 +142,49 @@ class LipSyncService:
             )
         except RunPodClientConfigError as exc:
             raise LipSyncServiceConfigError(str(exc)) from exc
+
+    def _optimized_pcm(self, pcm_bytes: bytes, *, sample_rate: int) -> bytes:
+        """Apply low-cost audio optimizations before lip-sync inference.
+
+        The goal is to reduce payload and model compute without changing user-visible
+        content quality for normal conversational turns.
+        """
+        optimized = pcm_bytes
+        if self._trim_silence and sample_rate > 0:
+            pad_samples = int(sample_rate * (self._silence_pad_ms / 1000.0))
+            optimized = trim_pcm16le_silence(
+                optimized,
+                threshold=self._silence_threshold,
+                pad_samples=pad_samples,
+            )
+        if self._max_audio_seconds > 0 and sample_rate > 0:
+            max_bytes = int(sample_rate * self._max_audio_seconds * 2)
+            if max_bytes > 0 and len(optimized) > max_bytes:
+                optimized = optimized[:max_bytes]
+        return optimized
+
+    def _load_persona_image(self, path: Path) -> tuple[bytes, str]:
+        """Load and cache avatar image bytes for repeated requests."""
+        resolved = path.resolve()
+        cached = self._persona_image_cache.get(resolved)
+        if cached is not None:
+            return cached
+        image_bytes = resolved.read_bytes()
+        mime = "image/png" if resolved.suffix.lower() == ".png" else "image/jpeg"
+        value = (image_bytes, mime)
+        self._persona_image_cache[resolved] = value
+        return value
+
+    def _direct_client(self, timeout_seconds: float) -> httpx.AsyncClient:
+        """Return a shared direct-mode HTTP client with keep-alive enabled."""
+        if self._direct_http_client is None:
+            self._direct_http_client = httpx.AsyncClient(
+                timeout=timeout_seconds,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                http2=True,
+            )
+        return self._direct_http_client
 
     def _extract_result_url(self, output: Any) -> Optional[str]:
         """Best-effort URL extraction across common RunPod handler schemas."""
@@ -185,6 +251,7 @@ class LipSyncService:
         """Return URL candidates for direct mode.
 
         If LIPSYNC_DIRECT_URL is a bare Runpod proxy root, try common handler paths.
+        The last-known working route is always prioritized first.
         """
         if not self._direct_url:
             return []
@@ -194,11 +261,23 @@ class LipSyncService:
 
         parsed = urlsplit(base_url)
         path = (parsed.path or "").strip()
-        candidates: list[str] = [base_url]
+        candidates: list[str] = []
+        if self._last_successful_direct_url:
+            candidates.append(self._last_successful_direct_url)
         if path not in {"", "/"}:
+            if base_url not in candidates:
+                candidates.append(base_url)
             return candidates
 
-        for route in ("/run", "/generate", "/predict", "/invocations"):
+        preferred_route = self._direct_preferred_path
+        if preferred_route and not preferred_route.startswith("/"):
+            preferred_route = f"/{preferred_route}"
+        routes: list[str] = []
+        if preferred_route:
+            routes.append(preferred_route)
+        routes.extend(["/generate", "/run", "/predict", "/invocations", "/"])
+
+        for route in routes:
             candidate = urlunsplit((parsed.scheme, parsed.netloc, route, parsed.query, ""))
             if candidate not in candidates:
                 candidates.append(candidate)
@@ -207,7 +286,11 @@ class LipSyncService:
     async def _generate_via_direct_url(
         self, payload: dict[str, Any], timeout_seconds: float
     ) -> LipSyncResult:
-        """POST payload to LIPSYNC_DIRECT_URL and parse JSON for video URL."""
+        """POST payload to direct mode endpoint and parse a video URL from response.
+
+        We intentionally try multiple handler-compatible routes in sequence so one
+        deployment can tolerate image/handler differences without code changes.
+        """
         attempted_errors: list[str] = []
         target_urls = self._direct_request_urls()
         if not target_urls:
@@ -218,41 +301,39 @@ class LipSyncService:
                 error="LIPSYNC_DIRECT_URL is not configured",
             )
 
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            for target_url in target_urls:
-                try:
-                    response = await client.post(
-                        target_url,
-                        json=payload,
-                        headers={"Content-Type": "application/json", "Accept": "application/json"},
-                    )
-                except httpx.HTTPError as exc:
-                    attempted_errors.append(f"{target_url}: request error ({exc})")
-                    continue
+        client = self._direct_client(timeout_seconds)
+        for target_url in target_urls:
+            try:
+                response = await client.post(target_url, json=payload)
+            except httpx.HTTPError as exc:
+                attempted_errors.append(f"{target_url}: request error ({exc})")
+                continue
 
-                try:
-                    response.raise_for_status()
-                except httpx.HTTPError:
-                    status = response.status_code
-                    reason = response.reason_phrase or "HTTP error"
-                    attempted_errors.append(f"{target_url}: {status} {reason}")
-                    continue
+            try:
+                response.raise_for_status()
+            except httpx.HTTPError:
+                status = response.status_code
+                reason = response.reason_phrase or "HTTP error"
+                attempted_errors.append(f"{target_url}: {status} {reason}")
+                continue
 
-                try:
-                    data = response.json()
-                except Exception as exc:
-                    attempted_errors.append(f"{target_url}: invalid JSON ({exc})")
-                    continue
+            try:
+                data = response.json()
+            except Exception as exc:
+                attempted_errors.append(f"{target_url}: invalid JSON ({exc})")
+                continue
 
-                url = self._extract_result_url(data)
-                if url:
-                    return LipSyncResult(talk_id="direct", status="done", result_url=url)
+            url = self._extract_result_url(data)
+            if url:
+                # Stick to the first known-good route on subsequent calls.
+                self._last_successful_direct_url = target_url
+                return LipSyncResult(talk_id="direct", status="done", result_url=url)
 
-                error_msg = self._extract_error_message(data)
-                if error_msg:
-                    attempted_errors.append(f"{target_url}: {error_msg}")
-                    continue
-                attempted_errors.append(f"{target_url}: response had no video URL")
+            error_msg = self._extract_error_message(data)
+            if error_msg:
+                attempted_errors.append(f"{target_url}: {error_msg}")
+                continue
+            attempted_errors.append(f"{target_url}: response had no video URL")
 
         max_entries = 4
         summary = " | ".join(attempted_errors[:max_entries])
@@ -277,6 +358,11 @@ class LipSyncService:
         session_id: Optional[str] = None,
         persona: Optional[str] = None,
     ) -> LipSyncResult:
+        """Generate avatar video from assistant PCM bytes.
+
+        Both direct and RunPod modes expect the same logical payload:
+        source image + WAV audio + options metadata.
+        """
         if self._direct_url:
             # Your own server on GPU pod: same payload, single POST, no RunPod API.
             if not pcm_bytes:
@@ -285,10 +371,12 @@ class LipSyncService:
                 return LipSyncResult(
                     talk_id="", status="failed", result_url=None, error="Persona image missing"
                 )
-            wav_bytes = pcm16le_to_wav(pcm_bytes, sample_rate=sample_rate, channels=1)
-            image_b64 = base64.b64encode(persona_image_path.read_bytes()).decode("ascii")
+            # Apply silence trimming/capping before serialization to reduce inference cost.
+            optimized_pcm = self._optimized_pcm(pcm_bytes, sample_rate=sample_rate)
+            wav_bytes = pcm16le_to_wav(optimized_pcm, sample_rate=sample_rate, channels=1)
+            image_bytes, mime = self._load_persona_image(persona_image_path)
+            image_b64 = base64.b64encode(image_bytes).decode("ascii")
             audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-            mime = "image/png" if persona_image_path.suffix.lower() == ".png" else "image/jpeg"
             payload = {
                 "model": self._model_name,
                 "session_id": session_id or "deckard-session",
@@ -317,24 +405,24 @@ class LipSyncService:
             )
         if not pcm_bytes:
             raise LipSyncServiceError("Assistant audio buffer is empty")
-        if len(pcm_bytes) > self._max_pcm_bytes:
+        # Shared optimization path for serverless mode.
+        optimized_pcm = self._optimized_pcm(pcm_bytes, sample_rate=sample_rate)
+        if len(optimized_pcm) > self._max_pcm_bytes:
             raise LipSyncServiceError(
-                f"Assistant audio exceeds max size ({len(pcm_bytes)} > {self._max_pcm_bytes} bytes)"
+                f"Assistant audio exceeds max size ({len(optimized_pcm)} > {self._max_pcm_bytes} bytes)"
             )
         if not persona_image_path.exists():
             raise LipSyncServiceError(f"Persona image missing: {persona_image_path}")
 
-        image_bytes = persona_image_path.read_bytes()
+        image_bytes, mime_type = self._load_persona_image(persona_image_path)
         if len(image_bytes) > self._max_image_bytes:
             raise LipSyncServiceError(
                 f"Persona image exceeds max size ({len(image_bytes)} > {self._max_image_bytes} bytes)"
             )
 
-        wav_bytes = pcm16le_to_wav(pcm_bytes, sample_rate=sample_rate, channels=1)
+        wav_bytes = pcm16le_to_wav(optimized_pcm, sample_rate=sample_rate, channels=1)
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-
-        mime_type = "image/png" if persona_image_path.suffix.lower() == ".png" else "image/jpeg"
         payload: dict[str, Any] = {
             "model": self._model_name,
             "session_id": session_id or "deckard-session",
@@ -392,3 +480,11 @@ class LipSyncService:
             result_url=self._extract_result_url(job.output),
             error=terminal_error,
         )
+
+    async def aclose(self) -> None:
+        """Close shared HTTP clients used by lip-sync providers."""
+        if self._direct_http_client is not None:
+            await self._direct_http_client.aclose()
+            self._direct_http_client = None
+        if self._client is not None and hasattr(self._client, "aclose"):
+            await self._client.aclose()  # type: ignore[attr-defined]

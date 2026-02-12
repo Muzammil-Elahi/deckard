@@ -372,6 +372,7 @@ export default function Home() {
     if (messages.length === 0) {
       return null;
     }
+    // Snapshot lightweight session analytics when a websocket session ends.
     const userTurns = messages.filter((message) => message.role === 'user').length;
     const assistantTurns = messages.filter((message) => message.role === 'assistant').length;
     const toolCalls = events.filter((event) => event.type === 'tool').length;
@@ -388,6 +389,7 @@ export default function Home() {
   }, [events, memoryKey, messages, responseMode]);
 
   const sendPayload = useCallback((payload: Record<string, unknown>) => {
+    // Centralized websocket sender so callsites can branch on delivery success.
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
@@ -397,6 +399,7 @@ export default function Home() {
   }, []);
 
   const stopPlayback = useCallback(() => {
+    // Hard-stop all scheduled audio nodes and reset timing cursor.
     for (const source of playbackSourcesRef.current) {
       try {
         source.stop();
@@ -413,6 +416,7 @@ export default function Home() {
 
   const playPcm16Base64 = useCallback(
     async (base64Audio: string) => {
+      // Backend emits raw PCM16 chunks (base64 encoded). Decode and schedule in WebAudio.
       if (typeof window === 'undefined' || !base64Audio) {
         return;
       }
@@ -554,6 +558,7 @@ export default function Home() {
 
   const handleRealtimeEvent = useCallback(
     (event: unknown) => {
+      // Single event reducer for websocket messages from backend realtime manager.
       if (!isRecord(event)) {
         return;
       }
@@ -770,7 +775,7 @@ export default function Home() {
       } catch (error) {
         console.warn('Microphone capture failed after connection.', error);
       }
-      // Send initial persona selection to backend
+      // Sync initial client-side controls to backend session state.
       try {
         sendPayload({ type: 'set_persona', persona });
         sendPayload({ type: 'set_response_mode', mode: responseMode });
@@ -838,6 +843,7 @@ export default function Home() {
   }, [logEvent, sendPayload, stopPlayback]);
 
   const sendTextMessage = useCallback(() => {
+    // Typed prompts share the same backend path as voice/image turns.
     const text = chatInput.trim();
     if (!text) {
       return;
@@ -852,6 +858,7 @@ export default function Home() {
       logEvent('session', 'Text not sent', 'Realtime socket is not open.', 'warn');
       return;
     }
+    // Mirror voice flow UX by marking the agent as active immediately.
     updatePipeline({ agent: 'active' });
     setIsThinking(true);
     setChatInput('');
@@ -886,6 +893,7 @@ export default function Home() {
       if (isTyping) {
         return;
       }
+      // App-level shortcuts only apply when focus is not inside an editable control.
       if (event.key.toLowerCase() === 'm' && isConnected) {
         event.preventDefault();
         toggleMute();
@@ -946,6 +954,7 @@ export default function Home() {
         const promptPayload = prompt || 'Please describe this image.';
         sendPayload({ type: 'image_start', id: imageId, text: promptPayload });
         const totalChunks = Math.max(1, Math.ceil(dataUrl.length / CHUNK_SIZE));
+        // Chunking keeps websocket frames bounded for large data URLs.
         for (let index = 0; index < dataUrl.length; index += CHUNK_SIZE) {
           sendPayload({ type: 'image_chunk', id: imageId, chunk: dataUrl.slice(index, index + CHUNK_SIZE) });
           const chunkNumber = Math.floor(index / CHUNK_SIZE) + 1;
@@ -1004,6 +1013,7 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
+      // Clear any pending UI timers and media resources when the page unmounts.
       if (uploadResetTimerRef.current) {
         window.clearTimeout(uploadResetTimerRef.current);
       }

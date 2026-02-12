@@ -126,6 +126,13 @@ class RunPodClient:
             assert normalized_endpoint_id is not None
             self._run_url = f"{normalized_base}/{normalized_endpoint_id}/run"
             self._status_url_template = f"{normalized_base}/{normalized_endpoint_id}/status/{{job_id}}"
+        # Keep-alive connections reduce TLS/session setup overhead on hot paths.
+        self._http = httpx.AsyncClient(
+            timeout=self._request_timeout_seconds,
+            headers=self.headers,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            http2=True,
+        )
 
     @property
     def headers(self) -> dict[str, str]:
@@ -139,32 +146,32 @@ class RunPodClient:
         return self._status_url_template.format(job_id=job_id)
 
     async def submit_job(self, payload: Mapping[str, Any]) -> str:
+        """Submit an inference job and return the provider job id."""
         body = {"input": dict(payload)}
-        async with httpx.AsyncClient(timeout=self._request_timeout_seconds) as client:
-            response = await client.post(self._run_url, json=body, headers=self.headers)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise RunPodClientError(
-                    f"RunPod submit failed with status {response.status_code}"
-                ) from exc
-            data = _coerce_dict(response.json())
+        response = await self._http.post(self._run_url, json=body)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RunPodClientError(
+                f"RunPod submit failed with status {response.status_code}"
+            ) from exc
+        data = _coerce_dict(response.json())
         job_id = data.get("id") or data.get("job_id")
         if not isinstance(job_id, str) or not job_id.strip():
             raise RunPodClientError(f"RunPod submit response missing job id: {data}")
         return job_id
 
     async def get_job(self, job_id: str) -> RunPodJob:
+        """Fetch and normalize current job status for a previously submitted job."""
         status_url = self._status_url(job_id)
-        async with httpx.AsyncClient(timeout=self._request_timeout_seconds) as client:
-            response = await client.get(status_url, headers=self.headers)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                raise RunPodClientError(
-                    f"RunPod status failed with status {response.status_code}"
-                ) from exc
-            data = _coerce_dict(response.json())
+        response = await self._http.get(status_url)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise RunPodClientError(
+                f"RunPod status failed with status {response.status_code}"
+            ) from exc
+        data = _coerce_dict(response.json())
 
         raw_status = str(data.get("status") or "UNKNOWN").upper()
         try:
@@ -194,6 +201,7 @@ class RunPodClient:
         poll_interval_seconds: float = 0.75,
         timeout_seconds: float = 120.0,
     ) -> RunPodJob:
+        """Poll job status until terminal state or timeout."""
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be > 0")
         if timeout_seconds <= 0:
@@ -223,3 +231,6 @@ class RunPodClient:
             raw=latest.raw,
         )
 
+    async def aclose(self) -> None:
+        """Close persistent HTTP resources used by this client."""
+        await self._http.aclose()

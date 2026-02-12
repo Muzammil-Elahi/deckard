@@ -6,6 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.services.audio_utils import trim_pcm16le_silence
 from app.services.lipsync import LipSyncService, LipSyncServiceError
 from app.services.runpod import (
     RunPodClientConfigError,
@@ -163,11 +164,11 @@ def test_direct_url_expands_root_to_common_handler_paths() -> None:
     service = LipSyncService(client=None, direct_url="https://abc123-8000.proxy.runpod.net/")
 
     assert service._direct_request_urls() == [
-        "https://abc123-8000.proxy.runpod.net/",
-        "https://abc123-8000.proxy.runpod.net/run",
         "https://abc123-8000.proxy.runpod.net/generate",
+        "https://abc123-8000.proxy.runpod.net/run",
         "https://abc123-8000.proxy.runpod.net/predict",
         "https://abc123-8000.proxy.runpod.net/invocations",
+        "https://abc123-8000.proxy.runpod.net/",
     ]
 
 
@@ -188,11 +189,11 @@ def test_direct_url_retries_common_paths_until_success(
             _ = exc_type, exc, tb
             return False
 
-        async def post(self, url: str, json: dict, headers: dict) -> httpx.Response:
+        async def post(self, url: str, json: dict, headers: dict | None = None) -> httpx.Response:
             _ = json, headers
             requested_urls.append(url)
             request = httpx.Request("POST", url)
-            if url.endswith("/generate"):
+            if url.endswith("/predict"):
                 return httpx.Response(
                     200,
                     json={"video_url": "https://cdn.example.com/direct.mp4"},
@@ -219,8 +220,20 @@ def test_direct_url_retries_common_paths_until_success(
     assert result.status == "done"
     assert result.result_url == "https://cdn.example.com/direct.mp4"
     assert requested_urls == [
-        "https://abc123-8000.proxy.runpod.net/",
-        "https://abc123-8000.proxy.runpod.net/run",
         "https://abc123-8000.proxy.runpod.net/generate",
+        "https://abc123-8000.proxy.runpod.net/run",
+        "https://abc123-8000.proxy.runpod.net/predict",
     ]
+
+
+def test_trim_pcm16le_silence_removes_leading_and_trailing_quiet() -> None:
+    # 4 silent samples + 3 voiced samples + 4 silent samples
+    samples = [0, 0, 0, 0, 1600, -1700, 1800, 0, 0, 0, 0]
+    pcm = b"".join(int(s).to_bytes(2, byteorder="little", signed=True) for s in samples)
+    trimmed = trim_pcm16le_silence(pcm, threshold=500, pad_samples=0)
+    trimmed_samples = [
+        int.from_bytes(trimmed[i : i + 2], byteorder="little", signed=True)
+        for i in range(0, len(trimmed), 2)
+    ]
+    assert trimmed_samples == [1600, -1700, 1800]
 

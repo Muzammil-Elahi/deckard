@@ -227,13 +227,16 @@ class RealtimeWebSocketManager:
         return self._memory_service
 
     def _response_mode_for_session(self, session_id: str) -> str:
+        """Resolve active response mode with per-session override + safe fallback."""
         mode = self.response_modes.get(session_id) or self._default_response_mode
         return mode if mode in VALID_RESPONSE_MODES else "synced"
 
     def _is_buffered_mode(self, session_id: str) -> bool:
+        """Return True when response should be coordinated (audio buffered for lip-sync)."""
         return self._response_mode_for_session(session_id) == "synced"
 
     def set_response_mode(self, session_id: str, mode: str) -> str:
+        """Set per-session response mode and clear stale coordinated buffers if needed."""
         normalized = (mode or "").strip().lower()
         selected = normalized if normalized in VALID_RESPONSE_MODES else "synced"
         self.response_modes[session_id] = selected
@@ -377,6 +380,14 @@ class RealtimeWebSocketManager:
         self.response_counters.pop(session_id, None)
         self.active_response_texts.pop(session_id, None)
         self.active_response_ids.pop(session_id, None)
+
+    async def shutdown(self) -> None:
+        """Release shared resources held across sessions."""
+        if self._lipsync_service is not None and hasattr(self._lipsync_service, "aclose"):
+            try:
+                await self._lipsync_service.aclose()
+            except Exception:
+                logger.exception("Failed to close lip-sync service resources cleanly")
 
     async def send_audio(self, session_id: str, audio_bytes: bytes):
         if session_id in self.active_sessions:
@@ -1405,7 +1416,10 @@ manager = RealtimeWebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _run_secret_safety_checks()
-    yield
+    try:
+        yield
+    finally:
+        await manager.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1438,6 +1452,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 audio_bytes = struct.pack(f"{len(int16_data)}h", *int16_data)
                 await manager.send_audio(session_id, audio_bytes)
             elif message["type"] == "text":
+                # Typed chat turns use the exact same assistant pipeline as voice turns.
+                # The model response still returns text/audio, and lip-sync generation
+                # is triggered from assistant audio events in `_process_events`.
                 raw_text = message.get("text", "")
                 text = " ".join(str(raw_text).split()).strip()
                 if not text:

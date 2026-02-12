@@ -32,13 +32,24 @@ class Settings:
     runpod_run_url: Optional[str] = os.getenv("RUNPOD_RUN_URL")
     runpod_status_url_template: Optional[str] = os.getenv("RUNPOD_STATUS_URL_TEMPLATE")
     runpod_request_timeout_seconds: float = float(os.getenv("RUNPOD_REQUEST_TIMEOUT_SECONDS", "30"))
-    runpod_poll_interval_seconds: float = float(os.getenv("RUNPOD_POLL_INTERVAL_SECONDS", "0.75"))
+    runpod_poll_interval_seconds: float = float(os.getenv("RUNPOD_POLL_INTERVAL_SECONDS", "0.4"))
     runpod_job_timeout_seconds: float = float(os.getenv("RUNPOD_JOB_TIMEOUT_SECONDS", "120"))
     lipsync_model_name: str = os.getenv("LIPSYNC_MODEL_NAME", "musetalk")
     # Direct lip-sync URL (e.g. your own server on a GPU pod). No RunPod API needed.
     # POST same payload as RunPod; response JSON with video_url/result_url/url.
     lipsync_direct_url: Optional[str] = os.getenv("LIPSYNC_DIRECT_URL")
     lipsync_direct_timeout_seconds: float = float(os.getenv("LIPSYNC_DIRECT_TIMEOUT_SECONDS", "120"))
+    # Preferred route tried first when LIPSYNC_DIRECT_URL is a proxy root.
+    lipsync_direct_preferred_path: str = os.getenv("LIPSYNC_DIRECT_PREFERRED_PATH", "/generate")
+    # Audio payload optimizations for lip-sync requests.
+    lipsync_trim_silence: bool = _env_bool("LIPSYNC_TRIM_SILENCE", True)
+    lipsync_silence_threshold: int = int(os.getenv("LIPSYNC_SILENCE_THRESHOLD", "500"))
+    lipsync_silence_pad_ms: int = int(os.getenv("LIPSYNC_SILENCE_PAD_MS", "120"))
+    # Optional hard cap for long assistant turns; 0 disables truncation.
+    lipsync_max_audio_seconds: float = float(os.getenv("LIPSYNC_MAX_AUDIO_SECONDS", "0"))
+    # Default delivery strategy for assistant output:
+    # - synced: coordinated audio + avatar video
+    # - fast: low-latency audio first, avatar video follows opportunistically
     response_mode_default: str = os.getenv("RESPONSE_MODE_DEFAULT", "synced").strip().lower() or "synced"
 
     # Legacy runpod URL retained for backward compatibility with old docs.

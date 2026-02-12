@@ -40,3 +40,40 @@ def pcm16le_to_wav(
     header += b"data" + struct.pack("<I", data_size)
     return header + pcm
 
+
+def trim_pcm16le_silence(
+    pcm: bytes,
+    *,
+    threshold: int = 500,
+    pad_samples: int = 0,
+) -> bytes:
+    """Trim leading/trailing silence from PCM16LE bytes.
+
+    This reduces lip-sync payload size and model inference time by removing
+    long quiet regions around spoken content.
+    """
+    if not pcm:
+        return pcm
+    if len(pcm) % 2 != 0:
+        # Invalid PCM16 frame alignment; return untouched for safety.
+        return pcm
+
+    sample_count = len(pcm) // 2
+    view = memoryview(pcm)
+    first: int | None = None
+    last: int | None = None
+
+    for idx in range(sample_count):
+        sample = struct.unpack_from("<h", view, idx * 2)[0]
+        if abs(sample) >= threshold:
+            if first is None:
+                first = idx
+            last = idx
+
+    if first is None or last is None:
+        return pcm
+
+    start = max(0, first - max(0, pad_samples))
+    end = min(sample_count, last + 1 + max(0, pad_samples))
+    return bytes(view[start * 2 : end * 2])
+
