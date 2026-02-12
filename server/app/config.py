@@ -7,6 +7,13 @@ from functools import lru_cache
 from typing import Optional
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 @dataclass
 class Settings:
     """Centralized environment-driven configuration.
@@ -32,11 +39,24 @@ class Settings:
     # POST same payload as RunPod; response JSON with video_url/result_url/url.
     lipsync_direct_url: Optional[str] = os.getenv("LIPSYNC_DIRECT_URL")
     lipsync_direct_timeout_seconds: float = float(os.getenv("LIPSYNC_DIRECT_TIMEOUT_SECONDS", "120"))
+    response_mode_default: str = os.getenv("RESPONSE_MODE_DEFAULT", "synced").strip().lower() or "synced"
 
     # Legacy runpod URL retained for backward compatibility with old docs.
     runpod_base_url: str = os.getenv("RUNPOD_BASE_URL", "https://runpod.example.com")
     supabase_url: Optional[str] = os.getenv("SUPABASE_URL")
     supabase_service_role_key: Optional[str] = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    # Memory guardrails
+    memory_max_local_entries: int = int(os.getenv("MEMORY_MAX_LOCAL_ENTRIES", "80"))
+    memory_max_recall_items: int = int(os.getenv("MEMORY_MAX_RECALL_ITEMS", "5"))
+    memory_max_summary_chars: int = int(os.getenv("MEMORY_MAX_SUMMARY_CHARS", "650"))
+    memory_local_ttl_seconds: float = float(os.getenv("MEMORY_LOCAL_TTL_SECONDS", "86400"))
+    memory_dedupe_window_seconds: float = float(os.getenv("MEMORY_DEDUPE_WINDOW_SECONDS", "900"))
+    memory_remote_timeout_seconds: float = float(os.getenv("MEMORY_REMOTE_TIMEOUT_SECONDS", "0.45"))
+    memory_remote_cache_ttl_seconds: float = float(os.getenv("MEMORY_REMOTE_CACHE_TTL_SECONDS", "30"))
+
+    # Safety checks
+    enable_secret_safety_checks: bool = _env_bool("ENABLE_SECRET_SAFETY_CHECKS", True)
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     # Legacy D-ID settings retained for compatibility while migrating.
     did_api_key: Optional[str] = os.getenv("DID_API_KEY")

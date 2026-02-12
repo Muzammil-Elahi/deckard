@@ -77,6 +77,7 @@ from app.services.memory import ConversationMemoryService
 
 
 VALID_SENTIMENTS = {"positive", "negative", "neutral"}
+VALID_RESPONSE_MODES = {"synced", "fast"}
 SENTIMENT_VIDEO_MAP: dict[str, dict[str, str]] = {
     "joi": {
         "positive": "/joi-happy.mp4",
@@ -190,9 +191,14 @@ class RealtimeWebSocketManager:
         self.active_response_texts: dict[str, list[str]] = {}  # session_id -> accumulating text parts
         self.active_response_ids: dict[str, str] = {}  # session_id -> current response_id
 
-        # When True, client receives coordinated audio+video after video is ready.
-        # This improves realism (lip-sync quality) at the cost of waiting until video generation finishes.
-        self.enable_response_buffering: bool = True
+        # Per-session response delivery mode:
+        # - synced: coordinated audio/video (best realism)
+        # - fast: stream audio immediately, generate video opportunistically
+        default_mode = settings.response_mode_default
+        self._default_response_mode = (
+            default_mode if default_mode in VALID_RESPONSE_MODES else "synced"
+        )
+        self.response_modes: dict[str, str] = {}
 
     def _service(self) -> LipSyncService:
         if self._lipsync_service is None:
@@ -209,8 +215,32 @@ class RealtimeWebSocketManager:
 
     def _memory(self) -> ConversationMemoryService:
         if self._memory_service is None:
-            self._memory_service = ConversationMemoryService()
+            self._memory_service = ConversationMemoryService(
+                max_local_entries=settings.memory_max_local_entries,
+                max_recall_items=settings.memory_max_recall_items,
+                max_summary_chars=settings.memory_max_summary_chars,
+                local_ttl_seconds=settings.memory_local_ttl_seconds,
+                dedupe_window_seconds=settings.memory_dedupe_window_seconds,
+                remote_timeout_seconds=settings.memory_remote_timeout_seconds,
+                remote_cache_ttl_seconds=settings.memory_remote_cache_ttl_seconds,
+            )
         return self._memory_service
+
+    def _response_mode_for_session(self, session_id: str) -> str:
+        mode = self.response_modes.get(session_id) or self._default_response_mode
+        return mode if mode in VALID_RESPONSE_MODES else "synced"
+
+    def _is_buffered_mode(self, session_id: str) -> bool:
+        return self._response_mode_for_session(session_id) == "synced"
+
+    def set_response_mode(self, session_id: str, mode: str) -> str:
+        normalized = (mode or "").strip().lower()
+        selected = normalized if normalized in VALID_RESPONSE_MODES else "synced"
+        self.response_modes[session_id] = selected
+        if selected == "fast":
+            # If switching away from synced mode mid-response, drop buffered state.
+            self._clear_response_buffer(session_id)
+        return selected
 
     def _memory_key_for_session(self, session_id: str) -> str:
         return self.memory_keys.get(session_id, session_id)
@@ -291,6 +321,7 @@ class RealtimeWebSocketManager:
         self.websockets[session_id] = websocket
         chosen_memory_key = (memory_key or "").strip() or session_id
         self.memory_keys[session_id] = chosen_memory_key
+        self.response_modes[session_id] = self._default_response_mode
 
         agent = get_starting_agent()
         runner = RealtimeRunner(agent)
@@ -332,6 +363,7 @@ class RealtimeWebSocketManager:
         self.persona_videos.pop(session_id, None)
         self.memory_keys.pop(session_id, None)
         self._last_memory_context.pop(session_id, None)
+        self.response_modes.pop(session_id, None)
 
         task = self._event_tasks.pop(session_id, None)
         if task:
@@ -1124,13 +1156,13 @@ class RealtimeWebSocketManager:
                 # Intercept assistant audio stream and build a lip-sync video when the turn ends.
                 if event.type == "audio":
                     # Check if we should use buffering for coordinated playback (avatar speaks in sync with audio).
-                    if self.enable_response_buffering:
+                    if self._is_buffered_mode(session_id):
                         await self._handle_buffered_audio(session_id, event.audio.data)
                     else:
                         # Immediate mode: always accumulate assistant audio for post-turn lip-sync.
                         self.response_audio_buffers.setdefault(session_id, bytearray()).extend(event.audio.data)
                 elif event.type == "audio_end":
-                    if self.enable_response_buffering:
+                    if self._is_buffered_mode(session_id):
                         buffer = self._get_response_buffer(session_id)
                         if buffer and buffer.audio_chunks:
                             asyncio.create_task(self._generate_buffered_video(session_id, buffer))
@@ -1207,7 +1239,7 @@ class RealtimeWebSocketManager:
                     await self._handle_raw_model_event(session_id, event.data)
 
                 # When buffering for sync, do not forward audio/audio_end; client gets them in coordinated block.
-                if event.type in ("audio", "audio_end") and self.enable_response_buffering:
+                if event.type in ("audio", "audio_end") and self._is_buffered_mode(session_id):
                     continue
 
                 event_data = await self._serialize_event(event)
@@ -1329,11 +1361,50 @@ class RealtimeWebSocketManager:
     # STT path intentionally removed in realtime-only flow
 
 
+def _masked_secret(value: str) -> str:
+    trimmed = value.strip()
+    if len(trimmed) <= 8:
+        return "***"
+    return f"{trimmed[:4]}...{trimmed[-4:]}"
+
+
+def _run_secret_safety_checks() -> None:
+    """Log startup warnings for common secret/config hygiene issues."""
+    if not settings.enable_secret_safety_checks:
+        return
+
+    openai_key = (settings.openai_api_key or "").strip()
+    runpod_key = (settings.runpod_api_key or "").strip()
+    repo_env = Path(__file__).resolve().parents[2] / ".env"
+
+    if not openai_key:
+        logger.warning("OPENAI_API_KEY is not set. Realtime assistant will not start.")
+    elif len(openai_key) < 20:
+        logger.warning("OPENAI_API_KEY looks too short. Verify it is correct.")
+    else:
+        logger.info("OPENAI_API_KEY detected (%s).", _masked_secret(openai_key))
+
+    if runpod_key:
+        logger.info("RUNPOD_API_KEY detected (%s).", _masked_secret(runpod_key))
+
+    if repo_env.exists():
+        logger.warning(
+            "Root .env file detected at %s. Ensure it stays local-only and never committed.",
+            repo_env,
+        )
+
+    if settings.did_api_key:
+        logger.info(
+            "DID_API_KEY is set but runtime path uses LipSyncService; verify this is intentional."
+        )
+
+
 manager = RealtimeWebSocketManager()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _run_secret_safety_checks()
     yield
 
 
@@ -1346,6 +1417,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     # If omitted, manager falls back to session_id-scoped memory.
     memory_key = websocket.query_params.get("memory_key")
     await manager.connect(websocket, session_id, memory_key=memory_key)
+    await websocket.send_text(
+        json.dumps(
+            {
+                "type": "client_info",
+                "info": "response_mode_set",
+                "mode": manager._response_mode_for_session(session_id),
+            }
+        )
+    )
     image_buffers: dict[str, dict[str, Any]] = {}
     try:
         while True:
@@ -1357,6 +1437,47 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 int16_data = message["data"]
                 audio_bytes = struct.pack(f"{len(int16_data)}h", *int16_data)
                 await manager.send_audio(session_id, audio_bytes)
+            elif message["type"] == "text":
+                raw_text = message.get("text", "")
+                text = " ".join(str(raw_text).split()).strip()
+                if not text:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": "Text message is empty.",
+                            }
+                        )
+                    )
+                    continue
+                try:
+                    # Keep memory context fresh for typed turns without stalling UX.
+                    await asyncio.wait_for(
+                        manager._inject_memory_context(
+                            session_id,
+                            prompt=text,
+                            include_remote=False,
+                        ),
+                        timeout=0.2,
+                    )
+                except Exception:
+                    pass
+
+                user_msg_text: RealtimeUserInputMessage = {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                }
+                await manager.send_user_message(session_id, user_msg_text)
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "client_info",
+                            "info": "text_enqueued",
+                            "chars": len(text),
+                        }
+                    )
+                )
             elif message["type"] == "image":
                 logger.info("Received image message from client (session %s).", session_id)
                 # Build a conversation.item.create with input_image (and optional input_text)
@@ -1484,6 +1605,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                         )
             elif message["type"] == "interrupt":
                 await manager.interrupt(session_id)
+            elif message["type"] == "set_response_mode":
+                requested_mode = str(message.get("mode") or "").lower()
+                if requested_mode not in VALID_RESPONSE_MODES:
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": f"Unknown response mode: {requested_mode}",
+                            }
+                        )
+                    )
+                    continue
+                selected_mode = manager.set_response_mode(session_id, requested_mode)
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "client_info",
+                            "info": "response_mode_set",
+                            "mode": selected_mode,
+                        }
+                    )
+                )
             elif message["type"] == "set_persona":
                 persona = str(message.get("persona") or "joi").lower()
                 if persona not in {"joi", "officer_k", "officer_j"}:

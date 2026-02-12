@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import re
 import time
 from collections import defaultdict, deque
@@ -47,17 +48,25 @@ class ConversationMemoryService:
         *,
         max_local_entries: int = 80,
         max_recall_items: int = 5,
+        max_summary_chars: int = 650,
+        local_ttl_seconds: float = 86_400,
+        dedupe_window_seconds: float = 900,
         remote_timeout_seconds: float = 0.45,
         remote_cache_ttl_seconds: float = 30.0,
     ) -> None:
         self._max_local_entries = max_local_entries
         self._max_recall_items = max_recall_items
+        self._max_summary_chars = max_summary_chars
+        self._local_ttl_seconds = local_ttl_seconds
+        self._dedupe_window_seconds = dedupe_window_seconds
         self._remote_timeout_seconds = remote_timeout_seconds
         self._remote_cache_ttl_seconds = remote_cache_ttl_seconds
         # In-memory rolling window per memory identity; this keeps recall fast and local.
         self._local: dict[str, deque[MemoryEntry]] = defaultdict(
             lambda: deque(maxlen=self._max_local_entries)
         )
+        # Signature timestamps used to skip repetitive writes in a short window.
+        self._recent_signatures: dict[str, dict[str, float]] = defaultdict(dict)
         # Tiny TTL cache to avoid repeated remote reads on rapid consecutive turns.
         self._remote_cache: dict[str, tuple[float, list[MemoryEntry]]] = {}
         self._client: Optional[Client] = None
@@ -95,6 +104,12 @@ class ConversationMemoryService:
             return
         key = _safe_memory_key(memory_key)
         now = time.time()
+        self._prune_local(key, now=now)
+        signature = cleaned.lower()
+        last_seen = self._recent_signatures[key].get(signature)
+        if last_seen is not None and (now - last_seen) < self._dedupe_window_seconds:
+            return
+        self._recent_signatures[key][signature] = now
         self._local[key].append(
             MemoryEntry(role=(role or "unknown").lower(), text=cleaned, created_at=now)
         )
@@ -148,6 +163,7 @@ class ConversationMemoryService:
         include_remote: bool = True,
     ) -> str:
         key = _safe_memory_key(memory_key)
+        self._prune_local(key)
         local_entries = list(self._local.get(key, ()))
         remote_entries = await self._recall_remote(key) if include_remote else []
 
@@ -181,12 +197,13 @@ class ConversationMemoryService:
         top_n = max_items if max_items is not None else self._max_recall_items
         selected = ranked[: max(1, top_n)]
 
+        summary_limit = max(120, min(max_chars, self._max_summary_chars))
         lines: list[str] = []
         total_chars = 0
         for entry in selected:
             role_tag = "User" if entry.role == "user" else "Assistant"
             line = f"- {role_tag}: {entry.text}"
-            if total_chars + len(line) > max_chars:
+            if total_chars + len(line) > summary_limit:
                 break
             lines.append(line)
             total_chars += len(line)
@@ -234,8 +251,37 @@ class ConversationMemoryService:
             role = "assistant"
             if "|role:user|" in label:
                 role = "user"
-            created_at = now
+            created_at = _parse_created_at(row.get("created_at")) or now
             parsed.append(MemoryEntry(role=role, text=text, created_at=created_at))
 
         self._remote_cache[key] = (now, parsed)
         return parsed
+
+    def _prune_local(self, key: str, *, now: Optional[float] = None) -> None:
+        """Drop expired local entries and stale dedupe signatures."""
+        ts = now if now is not None else time.time()
+        entries = self._local.get(key)
+        if entries:
+            while entries and (ts - entries[0].created_at) > self._local_ttl_seconds:
+                entries.popleft()
+
+        signatures = self._recent_signatures.get(key)
+        if signatures:
+            stale = [
+                sig
+                for sig, last_seen in signatures.items()
+                if (ts - last_seen) > self._dedupe_window_seconds
+            ]
+            for sig in stale:
+                signatures.pop(sig, None)
+
+
+def _parse_created_at(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).timestamp()
+        except ValueError:
+            return None
+    return None

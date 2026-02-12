@@ -23,10 +23,38 @@ type EventLogEntry = {
   ts: number;
 };
 
+type ResponseMode = 'synced' | 'fast';
+type PipelineNodeState = 'idle' | 'active' | 'done' | 'error';
+type PipelineState = {
+  capture: PipelineNodeState;
+  agent: PipelineNodeState;
+  lipsync: PipelineNodeState;
+  playback: PipelineNodeState;
+};
+
+type SessionSummary = {
+  userTurns: number;
+  assistantTurns: number;
+  toolCalls: number;
+  lastAssistantReply: string;
+  memoryKey: string;
+  responseMode: ResponseMode;
+  endedAt: number;
+};
+
 const DEFAULT_WS_BASE = process.env.NEXT_PUBLIC_REALTIME_WS_URL ?? 'ws://localhost:8000';
 const CHUNK_SIZE = 60_000;
 const MAX_EVENTS = 150;
 const MAX_MESSAGES = 200;
+const MAX_IMAGE_UPLOAD_MB = 8;
+const MAX_IMAGE_UPLOAD_BYTES = MAX_IMAGE_UPLOAD_MB * 1024 * 1024;
+const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const INITIAL_PIPELINE_STATE: PipelineState = {
+  capture: 'idle',
+  agent: 'idle',
+  lipsync: 'idle',
+  playback: 'idle',
+};
 type PersonaKey = 'joi' | 'officer_k' | 'officer_j';
 const PERSONA_DEFAULT_THINKING_VIDEO: Record<PersonaKey, string> = {
   joi: '/joi-thinking.mp4',
@@ -189,6 +217,7 @@ export default function Home() {
   const playbackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const coordinatedAudioBufferRef = useRef<string[]>([]);
   const isCoordinatedModeRef = useRef(false);
+  const uploadResetTimerRef = useRef<number | null>(null);
 
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -202,6 +231,13 @@ export default function Home() {
   const [events, setEvents] = useState<EventLogEntry[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [promptText, setPromptText] = useState('Please describe this image.');
+  const [chatInput, setChatInput] = useState('');
+  const [responseMode, setResponseMode] = useState<ResponseMode>('synced');
+  const [pipeline, setPipeline] = useState<PipelineState>(INITIAL_PIPELINE_STATE);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState('');
+  const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState('');
   const [userInteracted, setUserInteracted] = useState(false);
   const [leftPanelOpen, setLeftPanelOpen] = useState(false);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
@@ -218,6 +254,25 @@ export default function Home() {
       return PERSONA_DEFAULT_THINKING_VIDEO[persona];
     });
   }, [persona]);
+
+  const updatePipeline = useCallback((patch: Partial<PipelineState>) => {
+    setPipeline((previous) => ({ ...previous, ...patch }));
+  }, []);
+
+  useEffect(() => {
+    const micLive = isCapturing && !isMuted;
+    updatePipeline({
+      capture: micLive ? 'active' : isConnected ? 'idle' : 'idle',
+    });
+  }, [isCapturing, isConnected, isMuted, updatePipeline]);
+
+  useEffect(() => {
+    const parts: string[] = [];
+    if (statusText) parts.push(`Connection: ${statusText}`);
+    if (uploadStatus) parts.push(`Upload: ${uploadStatus}`);
+    if (lastError) parts.push(`Error: ${lastError}`);
+    setLiveAnnouncement(parts.join('. '));
+  }, [lastError, statusText, uploadStatus]);
 
   const logEvent = useCallback(
     (type: string, title: string, description?: string, severity: 'info' | 'warn' | 'error' = 'info') => {
@@ -312,6 +367,25 @@ export default function Home() {
     },
     [upsertMessage]
   );
+
+  const buildSessionSummary = useCallback((): SessionSummary | null => {
+    if (messages.length === 0) {
+      return null;
+    }
+    const userTurns = messages.filter((message) => message.role === 'user').length;
+    const assistantTurns = messages.filter((message) => message.role === 'assistant').length;
+    const toolCalls = events.filter((event) => event.type === 'tool').length;
+    const lastAssistant = [...messages].reverse().find((message) => message.role === 'assistant');
+    return {
+      userTurns,
+      assistantTurns,
+      toolCalls,
+      lastAssistantReply: lastAssistant?.text?.slice(0, 200) ?? 'No assistant reply captured.',
+      memoryKey: memoryKey || 'session-scoped',
+      responseMode,
+      endedAt: Date.now(),
+    };
+  }, [events, memoryKey, messages, responseMode]);
 
   const sendPayload = useCallback((payload: Record<string, unknown>) => {
     const ws = wsRef.current;
@@ -492,6 +566,7 @@ export default function Home() {
           if (url) {
             setVideoUrl(url);
             setIsThinking(false);
+            updatePipeline({ lipsync: 'done', playback: 'active', agent: 'done' });
             if (coordinated) {
               // Play buffered audio in sync with video (chunks already queued in order via playbackCursorRef).
               const chunks = coordinatedAudioBufferRef.current;
@@ -512,12 +587,14 @@ export default function Home() {
         case 'talk_error': {
           const error = typeof event.error === 'string' ? event.error : 'Unknown lip-sync error';
           setIsThinking(false);
+          updatePipeline({ lipsync: 'error', playback: 'active' });
           logEvent('error', 'Lip-sync generation failed', error, 'error');
           break;
         }
         case 'audio': {
           const payload = typeof event.audio === 'string' ? event.audio : null;
           if (payload) {
+            updatePipeline({ playback: 'active' });
             if (isCoordinatedModeRef.current) {
               coordinatedAudioBufferRef.current.push(payload);
             } else {
@@ -532,6 +609,7 @@ export default function Home() {
           if (context) {
             playbackCursorRef.current = Math.max(playbackCursorRef.current, context.currentTime);
           }
+          updatePipeline({ playback: 'done', agent: 'done' });
           break;
         }
         case 'history_updated': {
@@ -546,12 +624,14 @@ export default function Home() {
         }
         case 'tool_start': {
           const tool = typeof event.tool === 'string' ? event.tool : 'tool';
+          updatePipeline({ agent: 'active' });
           logEvent('tool', `Tool running`, `Started ${tool}`);
           break;
         }
         case 'tool_end': {
           const tool = typeof event.tool === 'string' ? event.tool : 'tool';
           const output = typeof event.output === 'string' ? event.output : 'no output';
+          updatePipeline({ agent: 'done' });
           logEvent('tool', `Tool completed`, `${tool}: ${output}`);
           break;
         }
@@ -574,6 +654,7 @@ export default function Home() {
               setThinkingVideo(video);
             }
             setIsThinking(true);
+            updatePipeline({ agent: 'active', lipsync: 'active' });
             logEvent('response', 'Processing Response', message);
           } else if (info === 'persona_mood_update') {
             const personaRaw = typeof event.persona === 'string' ? event.persona : null;
@@ -597,12 +678,23 @@ export default function Home() {
             }
           } else if (info === 'did_talk_start') {
             setIsThinking(true);
+            updatePipeline({ lipsync: 'active' });
             logEvent('video', 'Video generation started');
           } else if (info === 'coordinated_audio_start') {
             isCoordinatedModeRef.current = true;
             coordinatedAudioBufferRef.current = [];
             setIsThinking(true);
+            updatePipeline({ playback: 'idle', lipsync: 'active', agent: 'active' });
             logEvent('video', 'Coordinated playback', 'Buffering audio for sync');
+          } else if (info === 'response_mode_set') {
+            const mode = typeof event.mode === 'string' ? event.mode : '';
+            if (mode === 'synced' || mode === 'fast') {
+              setResponseMode(mode);
+              logEvent('session', 'Response mode set', mode === 'synced' ? 'Synced avatar mode' : 'Fast audio mode');
+            }
+          } else if (info === 'text_enqueued') {
+            const chars = typeof event.chars === 'number' ? event.chars : 0;
+            logEvent('session', 'Text message enqueued', `${chars} characters sent`);
           } else {
             logEvent('client', `Client info`, info);
           }
@@ -620,6 +712,7 @@ export default function Home() {
         }
         case 'input_audio_timeout_triggered': {
           if (sendPayload({ type: 'commit_audio' })) {
+            updatePipeline({ agent: 'active' });
             logEvent('session', 'Committed audio buffer');
           }
           break;
@@ -631,6 +724,7 @@ export default function Home() {
         }
         case 'error': {
           const message = event.error ? String(event.error) : 'Unknown realtime error';
+          updatePipeline({ agent: 'error' });
           logEvent('error', 'Realtime error', message, 'error');
           break;
         }
@@ -640,7 +734,7 @@ export default function Home() {
         }
       }
     },
-    [ingestHistory, ingestItem, logEvent, playPcm16Base64, sendPayload]
+    [ingestHistory, ingestItem, logEvent, playPcm16Base64, sendPayload, updatePipeline]
   );
 
   const openConnection = useCallback(() => {
@@ -662,6 +756,8 @@ export default function Home() {
     const url = buildWsUrl(wsBase, effectiveId, effectiveMemoryKey);
     const socket = new WebSocket(url);
     wsRef.current = socket;
+    setSessionSummary(null);
+    setPipeline(INITIAL_PIPELINE_STATE);
     logEvent('session', 'Connecting', `Dialing ${url}`);
 
     socket.onopen = async () => {
@@ -677,6 +773,7 @@ export default function Home() {
       // Send initial persona selection to backend
       try {
         sendPayload({ type: 'set_persona', persona });
+        sendPayload({ type: 'set_response_mode', mode: responseMode });
       } catch {}
     };
 
@@ -702,9 +799,11 @@ export default function Home() {
       setStatusText('Disconnected');
       stopCapture();
       stopPlayback();
+      setPipeline((previous) => ({ ...previous, capture: 'idle' }));
+      setSessionSummary(buildSessionSummary());
       wsRef.current = null;
     };
-  }, [buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, memoryKey, persona, sendPayload, sessionId, startCapture, stopCapture, stopPlayback, wsBase]);
+  }, [buildSessionSummary, buildWsUrl, handleRealtimeEvent, isConnected, isConnecting, logEvent, memoryKey, persona, responseMode, sendPayload, sessionId, startCapture, stopCapture, stopPlayback, wsBase]);
 
   const closeConnection = useCallback(() => {
     const ws = wsRef.current;
@@ -717,8 +816,10 @@ export default function Home() {
       setStatusText('Disconnected');
       stopCapture();
       stopPlayback();
+      setPipeline((previous) => ({ ...previous, capture: 'idle' }));
+      setSessionSummary(buildSessionSummary());
     }
-  }, [stopCapture, stopPlayback]);
+  }, [buildSessionSummary, stopCapture, stopPlayback]);
 
   const toggleMute = useCallback(() => {
     setIsMuted((prev) => {
@@ -736,12 +837,95 @@ export default function Home() {
     }
   }, [logEvent, sendPayload, stopPlayback]);
 
+  const sendTextMessage = useCallback(() => {
+    const text = chatInput.trim();
+    if (!text) {
+      return;
+    }
+    if (!isConnected) {
+      logEvent('session', 'Text not sent', 'Connect before sending a text message.', 'warn');
+      return;
+    }
+    appendLocalMessage({ role: 'user', text });
+    const sent = sendPayload({ type: 'text', text });
+    if (!sent) {
+      logEvent('session', 'Text not sent', 'Realtime socket is not open.', 'warn');
+      return;
+    }
+    updatePipeline({ agent: 'active' });
+    setIsThinking(true);
+    setChatInput('');
+    logEvent('session', 'Text message sent');
+  }, [appendLocalMessage, chatInput, isConnected, logEvent, sendPayload, updatePipeline]);
+
+  const applyResponseMode = useCallback(
+    (mode: ResponseMode) => {
+      setResponseMode(mode);
+      if (isConnected) {
+        sendPayload({ type: 'set_response_mode', mode });
+      }
+      logEvent(
+        'session',
+        'Response mode selected',
+        mode === 'synced'
+          ? 'Synced avatar mode prioritizes realism.'
+          : 'Fast mode prioritizes lower perceived latency.'
+      );
+    },
+    [isConnected, logEvent, sendPayload]
+  );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping =
+        !!target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.isContentEditable);
+      if (isTyping) {
+        return;
+      }
+      if (event.key.toLowerCase() === 'm' && isConnected) {
+        event.preventDefault();
+        toggleMute();
+      } else if (event.key.toLowerCase() === 'i' && isConnected) {
+        event.preventDefault();
+        fileInputRef.current?.click();
+      } else if (event.key === 'Escape' && isConnected) {
+        event.preventDefault();
+        interrupt();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [interrupt, isConnected, toggleMute]);
+
   const handleFileSelected = useCallback(
     async (file: File | null) => {
       if (!file) {
         return;
       }
+      if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+        setUploadProgress(0);
+        setUploadStatus('Unsupported image type. Use JPG, PNG, or WebP.');
+        logEvent('image', 'Image rejected', 'Unsupported file format. Use JPG, PNG, or WebP.', 'warn');
+        return;
+      }
+      if (file.size > MAX_IMAGE_UPLOAD_BYTES) {
+        setUploadProgress(0);
+        setUploadStatus(`Image too large. Limit is ${MAX_IMAGE_UPLOAD_MB} MB.`);
+        logEvent(
+          'image',
+          'Image rejected',
+          `Selected file is ${(file.size / 1_048_576).toFixed(2)} MB. Limit is ${MAX_IMAGE_UPLOAD_MB} MB.`,
+          'warn'
+        );
+        return;
+      }
       try {
+        setUploadStatus('Preparing image...');
+        setUploadProgress(10);
         const dataUrl = await prepareImageDataUrl(file);
         const prompt = promptText.trim();
         appendLocalMessage({
@@ -752,19 +936,37 @@ export default function Home() {
         const ws = wsRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) {
           logEvent('image', 'Image not sent', 'Connect before uploading an image.', 'warn');
+          setUploadProgress(0);
+          setUploadStatus('Connect first to send an image.');
           return;
         }
+        setUploadStatus('Uploading image...');
         sendPayload({ type: 'interrupt' });
         const imageId = randomId('img');
         const promptPayload = prompt || 'Please describe this image.';
         sendPayload({ type: 'image_start', id: imageId, text: promptPayload });
+        const totalChunks = Math.max(1, Math.ceil(dataUrl.length / CHUNK_SIZE));
         for (let index = 0; index < dataUrl.length; index += CHUNK_SIZE) {
           sendPayload({ type: 'image_chunk', id: imageId, chunk: dataUrl.slice(index, index + CHUNK_SIZE) });
+          const chunkNumber = Math.floor(index / CHUNK_SIZE) + 1;
+          const progress = 10 + Math.round((chunkNumber / totalChunks) * 85);
+          setUploadProgress(Math.min(95, progress));
         }
         sendPayload({ type: 'image_end', id: imageId });
+        setUploadProgress(100);
+        setUploadStatus('Image sent to AI.');
         logEvent('image', 'Image enqueued', `Sent ${(dataUrl.length / 1_024).toFixed(1)} KB payload`);
+        if (uploadResetTimerRef.current) {
+          window.clearTimeout(uploadResetTimerRef.current);
+        }
+        uploadResetTimerRef.current = window.setTimeout(() => {
+          setUploadProgress(0);
+          setUploadStatus('');
+        }, 3500);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown image processing error';
+        setUploadProgress(0);
+        setUploadStatus('Image processing failed.');
         logEvent('error', 'Image processing failed', message, 'error');
       } finally {
         if (fileInputRef.current) {
@@ -802,6 +1004,9 @@ export default function Home() {
 
   useEffect(() => {
     return () => {
+      if (uploadResetTimerRef.current) {
+        window.clearTimeout(uploadResetTimerRef.current);
+      }
       const ws = wsRef.current;
       if (ws) {
         ws.close();
@@ -815,6 +1020,9 @@ export default function Home() {
 
   return (
     <div className="relative min-h-screen overflow-hidden text-stone-100">
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {liveAnnouncement}
+      </div>
       <div className="pointer-events-none absolute inset-0 -z-20">
         <Image
           src="/website background.png"
@@ -890,6 +1098,37 @@ export default function Home() {
                 </div>
               ))
             )}
+          </div>
+          <div className="mt-4 rounded-2xl border border-stone-500/30 bg-stone-950/45 p-3">
+            <label htmlFor="chat-composer" className="text-[0.55rem] font-semibold uppercase tracking-[0.35em] text-stone-500">
+              Send Text
+            </label>
+            <textarea
+              id="chat-composer"
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  sendTextMessage();
+                }
+              }}
+              rows={3}
+              disabled={!isConnected}
+              placeholder={isConnected ? 'Type a message and press Enter' : 'Connect to send text'}
+              className="mt-2 w-full resize-none rounded-xl border border-stone-500/30 bg-stone-900/50 px-3 py-2 text-sm text-stone-100 placeholder:text-stone-500 focus:border-emerald-300/60 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+            />
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <span className="text-[0.65rem] text-stone-500">Enter to send, Shift+Enter for newline</span>
+              <button
+                type="button"
+                onClick={sendTextMessage}
+                disabled={!isConnected || chatInput.trim().length === 0}
+                className="rounded-full border border-stone-500/30 px-3 py-1.5 text-[0.65rem] font-semibold uppercase tracking-[0.28em] text-stone-200 transition hover:border-emerald-300/50 hover:text-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Send
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -969,6 +1208,13 @@ export default function Home() {
           <p className="mt-4 mx-auto max-w-2xl text-base text-stone-300 sm:text-lg">
             Create and interact with personalized AI clones
           </p>
+          <div className="mt-5 mx-auto max-w-3xl rounded-2xl border border-stone-500/30 bg-stone-900/45 px-5 py-4 text-left text-sm leading-relaxed text-stone-300 shadow-[0_18px_60px_rgba(15,23,42,0.45)]">
+            <span className="block text-[0.6rem] font-semibold uppercase tracking-[0.35em] text-stone-400">How It Works</span>
+            <p className="mt-2">
+              Your voice is streamed to a realtime AI agent, which can use tools and optional uploaded image context to build a response.
+              The generated assistant audio is then synchronized with the selected avatar for a conversational lip-synced reply.
+            </p>
+          </div>
         </div>
 
         {/* Main Content Area with Avatar */}
@@ -1009,10 +1255,38 @@ export default function Home() {
                   </span>
                 </div>
                 {lastError ? (
-                  <div className="rounded-2xl border border-rose-500/50 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+                  <div role="alert" aria-live="assertive" className="rounded-2xl border border-rose-500/50 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
                     {lastError}
                   </div>
                 ) : null}
+                <div className="rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
+                  <div className="text-[0.55rem] font-semibold uppercase tracking-[0.35em] text-stone-500">Pipeline</div>
+                  <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    {([
+                      ['Capture', pipeline.capture],
+                      ['Agent', pipeline.agent],
+                      ['Lip-sync', pipeline.lipsync],
+                      ['Playback', pipeline.playback],
+                    ] as const).map(([label, state]) => (
+                      <div key={label} className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2">
+                        <div className="text-[0.55rem] uppercase tracking-[0.28em] text-stone-400">{label}</div>
+                        <div
+                          className={`mt-1 text-xs font-semibold ${
+                            state === 'active'
+                              ? 'text-emerald-200'
+                              : state === 'done'
+                              ? 'text-sky-200'
+                              : state === 'error'
+                              ? 'text-rose-200'
+                              : 'text-stone-400'
+                          }`}
+                        >
+                          {state}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
 
               <div className="relative mx-auto mt-8 w-full max-w-sm overflow-hidden rounded-[28px] border border-stone-500/35 bg-gradient-to-b from-stone-950/85 via-stone-900/35 to-stone-950/95" data-testid="talking-video-box" style={{ aspectRatio: '9 / 16' }}>
@@ -1063,6 +1337,43 @@ export default function Home() {
                 ))}
               </div>
 
+              <div className="mt-5 rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[0.55rem] font-semibold uppercase tracking-[0.35em] text-stone-500">Response Mode</p>
+                    <p className="mt-1 text-xs text-stone-400">
+                      Choose realism or speed for assistant playback.
+                    </p>
+                  </div>
+                  <div className="inline-flex rounded-full border border-stone-500/30 bg-stone-900/40 p-1">
+                    <button
+                      type="button"
+                      onClick={() => applyResponseMode('synced')}
+                      className={`rounded-full px-4 py-2 text-[0.65rem] font-semibold uppercase tracking-[0.28em] transition ${
+                        responseMode === 'synced'
+                          ? 'bg-emerald-400/20 text-emerald-100'
+                          : 'text-stone-300 hover:text-stone-100'
+                      }`}
+                      aria-pressed={responseMode === 'synced'}
+                    >
+                      Synced
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => applyResponseMode('fast')}
+                      className={`rounded-full px-4 py-2 text-[0.65rem] font-semibold uppercase tracking-[0.28em] transition ${
+                        responseMode === 'fast'
+                          ? 'bg-emerald-400/20 text-emerald-100'
+                          : 'text-stone-300 hover:text-stone-100'
+                      }`}
+                      aria-pressed={responseMode === 'fast'}
+                    >
+                      Fast
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               <div className="mt-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <button
                   className={`rounded-full px-5 py-3 text-sm font-semibold uppercase tracking-[0.35em] transition ${
@@ -1080,7 +1391,7 @@ export default function Home() {
                   }}
                   disabled={isConnecting}
                 >
-                  {isConnected ? 'Disconnect' : isConnecting ? 'Connecting…' : 'Connect'}
+                  {isConnected ? 'Disconnect' : isConnecting ? 'Connecting...' : 'Connect'}
                 </button>
                 <button
                   className={`rounded-full border border-stone-500/30 px-5 py-3 text-sm font-semibold uppercase tracking-[0.35em] transition ${
@@ -1114,10 +1425,54 @@ export default function Home() {
                 />
               </div>
 
+              <div className="mt-4 rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-400">
+                  <span>Accepted: JPG, PNG, WebP</span>
+                  <span>Max file size: {MAX_IMAGE_UPLOAD_MB} MB</span>
+                  <span className="hidden sm:inline">Shortcuts: M mute, I upload image, Esc interrupt</span>
+                </div>
+                {uploadStatus ? (
+                  <div className="mt-3" aria-live="polite">
+                    <div className="flex items-center justify-between text-xs text-stone-300">
+                      <span>{uploadStatus}</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <div className="mt-1 h-1.5 w-full rounded-full bg-stone-800">
+                      <div
+                        className="h-1.5 rounded-full bg-emerald-300 transition-all duration-200"
+                        style={{ width: `${Math.max(0, Math.min(uploadProgress, 100))}%` }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
               <div className="mt-6 grid gap-4 sm:grid-cols-5">
                 <div className="sm:col-span-3">
-                  <label className="text-[0.6rem] font-semibold uppercase tracking-[0.35em] text-stone-500">Image Prompt</label>
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="image-prompt" className="text-[0.6rem] font-semibold uppercase tracking-[0.35em] text-stone-500">
+                      Image Prompt
+                    </label>
+                    <div className="group relative inline-flex items-center">
+                      <button
+                        type="button"
+                        aria-label="What this prompt does"
+                        aria-describedby="image-prompt-tooltip"
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-stone-500/40 text-[0.65rem] font-semibold text-stone-300 transition hover:border-stone-300 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300/70"
+                      >
+                        i
+                      </button>
+                      <div
+                        id="image-prompt-tooltip"
+                        role="tooltip"
+                        className="pointer-events-none absolute left-7 top-1/2 z-20 w-72 -translate-y-1/2 rounded-xl border border-stone-500/40 bg-stone-950/95 px-3 py-2 text-[0.72rem] leading-relaxed text-stone-200 opacity-0 shadow-[0_16px_50px_rgba(15,23,42,0.45)] transition group-hover:opacity-100 group-focus-within:opacity-100"
+                      >
+                        This prompt is sent together with your uploaded image so the AI can interpret the image using your instructions.
+                      </div>
+                    </div>
+                  </div>
                   <input
+                    id="image-prompt"
                     className="mt-2 w-full rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3 text-sm text-stone-100 shadow-[0_12px_60px_rgba(15,23,42,0.4)] focus:border-emerald-300/60 focus:outline-none focus:ring-0"
                     value={promptText}
                     onChange={(event) => setPromptText(event.target.value)}
@@ -1140,7 +1495,7 @@ export default function Home() {
                 <div className="rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
                   <span className="text-[0.55rem] font-semibold uppercase tracking-[0.4em] text-stone-500">Session</span>
                   <span className="mt-2 block truncate text-sm text-stone-200" suppressHydrationWarning>
-                    {sessionId || '—'}
+                    {sessionId || '-'}
                   </span>
                 </div>
                 <div className="rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-3">
@@ -1150,6 +1505,38 @@ export default function Home() {
                   </span>
                 </div>
               </div>
+
+              {sessionSummary ? (
+                <div className="mt-4 rounded-2xl border border-stone-500/30 bg-stone-950/45 px-4 py-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[0.55rem] font-semibold uppercase tracking-[0.4em] text-stone-500">Session Summary</span>
+                    <span className="text-xs text-stone-400">{new Date(sessionSummary.endedAt).toLocaleTimeString()}</span>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                    <div className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs text-stone-300">
+                      User turns: <span className="font-semibold text-stone-100">{sessionSummary.userTurns}</span>
+                    </div>
+                    <div className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs text-stone-300">
+                      Assistant turns: <span className="font-semibold text-stone-100">{sessionSummary.assistantTurns}</span>
+                    </div>
+                    <div className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs text-stone-300">
+                      Tool calls: <span className="font-semibold text-stone-100">{sessionSummary.toolCalls}</span>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs text-stone-300">
+                      Response mode: <span className="font-semibold text-stone-100">{sessionSummary.responseMode}</span>
+                    </div>
+                    <div className="rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs text-stone-300 truncate">
+                      Memory key: <span className="font-semibold text-stone-100">{sessionSummary.memoryKey}</span>
+                    </div>
+                  </div>
+                  <p className="mt-3 rounded-xl border border-stone-500/25 bg-stone-900/35 px-3 py-2 text-xs leading-relaxed text-stone-300">
+                    <span className="font-semibold text-stone-100">Last assistant reply:</span>{' '}
+                    {sessionSummary.lastAssistantReply}
+                  </p>
+                </div>
+              ) : null}
             </div>
 
             {/* Right Toggle Button - Feed */}

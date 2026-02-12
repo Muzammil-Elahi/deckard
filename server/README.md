@@ -23,11 +23,32 @@ FastAPI backend for realtime conversation orchestration:
    uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
    ```
 
+## Preflight checks
+Run quick configuration checks before booting services:
+```bash
+uv run python scripts/preflight.py
+```
+
+Optional network validation for direct lip-sync mode:
+```bash
+uv run python scripts/preflight.py --check-http
+```
+
 ## Websocket memory key
 - Endpoint: `/ws/{session_id}?memory_key={stable_user_key}`
 - If `memory_key` is provided, server memory recall/persistence uses it as the identity key.
 - If omitted, `session_id` is used as fallback.
 - Memory writes are asynchronous and should not block the realtime loop.
+
+## Websocket control messages
+Client -> server control events:
+- `text` with plain user text payload
+- `set_persona` with `persona` in `joi | officer_k | officer_j`
+- `set_response_mode` with `mode` in `synced | fast`
+
+Server -> client confirmations:
+- `client_info` with `info=response_mode_set` and the selected mode
+- `client_info` with `info=persona_set` and the selected persona
 
 ## Co-Located Lip-Sync Server (Same GPU Pod)
 If you are running Deckard on a RunPod GPU pod and want the lip-sync model on the same machine:

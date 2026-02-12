@@ -13,6 +13,11 @@ All notable changes to this project are documented in this file.
 - Added memory service tests in `server/tests/test_memory.py`.
 - Added onboarding and operations documentation in `docs/DEVELOPER_GUIDE.md`, `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `docs/README.md`.
 - Added a new developer onboarding checklist to `AGENTS.md` for faster contributor ramp-up.
+- Added backend preflight checks in `server/scripts/preflight.py` to validate env configuration, lip-sync provider readiness, memory guardrails, and optional endpoint health.
+- Added a session summary card, pipeline status bar, and response-mode controls to `web/src/app/page.tsx` for clearer runtime visibility and faster troubleshooting.
+- Added image-upload guardrails in `web/src/app/page.tsx` (type/size validation, upload progress feedback, and keyboard shortcuts).
+- Added accessibility enhancements in `web/src/app/page.tsx` including `aria-live` status announcements and assertive error alerts.
+- Added typed chat composition in the left conversation panel (`web/src/app/page.tsx`) so users can send text prompts directly to the realtime session.
 
 ### Changed
 - Replaced the stale root README with a current setup/status guide aligned to the active OpenAI Realtime + self-hosted lip-sync architecture.
@@ -28,3 +33,9 @@ All notable changes to this project are documented in this file.
 - Improved lip-sync result parsing to accept additional output keys (`video`, `videoUrl`, base64 variants) and explicit unavailable-provider errors in `server/app/services/lipsync.py`.
 - Updated backend talk delivery to emit `talk_error` when lip-sync returns no video URL instead of silent empty `talk_video` payloads.
 - Updated websocket connect URL handling in `web/src/app/page.tsx` and `server/app/main.py` to support a stable `memory_key` for cross-session personalization.
+- Updated `web/src/app/page.tsx` with an accessible tooltip beside the Image Prompt label and a clear inline blurb explaining that the prompt is sent with the uploaded image to the AI.
+- Refined the same inline blurb in `web/src/app/page.tsx` to describe the full application flow (realtime agent, tools/image context, and synchronized avatar response).
+- Repositioned the app-level "How It Works" blurb to the page header area in `web/src/app/page.tsx` so application context is presented in a more appropriate UI location.
+- Updated `server/.env.example` and `server/README.md` with response mode defaults, memory/safety guardrail env vars, and the new preflight workflow.
+- Updated `server/app/main.py` and `server/app/services/memory.py` with response mode switching, secret-safety startup checks, TTL/dedupe memory controls, and bounded memory recall summarization.
+- Updated websocket message handling in `server/app/main.py` to accept `text` payloads and enqueue them as structured realtime user messages, enabling typed turns that still produce text/audio/lip-sync outputs.
